@@ -33,6 +33,12 @@ const designAssetUrls = {
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 
+// Cap on simultaneously-open /api/stream connections. Each open stream holds a socket and adds a
+// "feedback"/"ended" listener to the shared emitter, so an unbounded number would exhaust sockets
+// and trip Node's MaxListenersExceededWarning. The agent normally keeps a single stream open, so
+// this is generous headroom while still bounding runaway growth.
+const DEFAULT_MAX_STREAM_CLIENTS = 16;
+
 // A detached server should not live forever. When no browser chrome (SSE) and no agent poll
 // are connected for this long, the server shuts itself down so it stops dangling. The next
 // `lavish-axi <file>` invocation re-spawns a fresh server and adopts the session from
@@ -57,14 +63,21 @@ export async function serve({
   idleTimeoutMs = resolveIdleTimeoutMs(),
   host = bindHost(),
   linkHost: linkHostName = linkHost(),
+  maxStreamClients = DEFAULT_MAX_STREAM_CLIENTS,
 }) {
   const app = express();
   const store = new SessionStore(stateFile);
   const events = new EventEmitter();
+  // Each open /api/stream and /api/poll registers a "feedback"/"ended" listener, and each browser
+  // SSE chrome registers three more. Lift Node's default 10-listener ceiling above the stream cap
+  // (plus headroom for polls and browser chromes) so legitimate fan-out doesn't emit a spurious
+  // MaxListenersExceededWarning, while a real listener leak past this bound still surfaces.
+  events.setMaxListeners(maxStreamClients + 24);
   const watchers = new Map();
   const activePolls = new Map();
   const deliveredFeedback = new Set();
   const sseClients = new Set();
+  const streamClients = new Set();
   const verbose = debug || process.env.LAVISH_AXI_DEBUG === "1";
   const writeLog = typeof log === "function" ? log : (line) => process.stderr.write(`${line}\n`);
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
@@ -194,6 +207,14 @@ export async function serve({
         res.status(404).json({ status: "missing" });
         return;
       }
+      // Bound concurrent streams so a flood of connections can't exhaust sockets/listeners. The
+      // agent keeps one stream open per session; anything past the cap is a misuse or a leak.
+      if (streamClients.size >= maxStreamClients) {
+        res.set("Retry-After", "5");
+        res.status(503).json({ status: "busy", error: `too many concurrent streams (max ${maxStreamClients})` });
+        return;
+      }
+      streamClients.add(res);
       res.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
@@ -273,6 +294,7 @@ export async function serve({
       heartbeat.unref?.();
 
       req.on("close", () => {
+        streamClients.delete(res);
         clearInterval(heartbeat);
         events.off("feedback", onFeedback);
         events.off("ended", onFeedback);

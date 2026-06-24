@@ -1896,6 +1896,106 @@ test("an open /api/stream connection reports presence as listening (folds in cha
   }
 });
 
+test("GET /api/stream caps concurrent connections and frees the slot on disconnect (HIGH regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-cap-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    maxStreamClients: 2,
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const controllers = [];
+  const openStream = () => {
+    const controller = new AbortController();
+    controllers.push(controller);
+    return fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+  };
+  try {
+    await openSession(base, artifact);
+
+    const first = await openStream();
+    const second = await openStream();
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+
+    // A third stream exceeds the cap: rejected with 503 + Retry-After rather than another open SSE.
+    const third = await openStream();
+    assert.equal(third.status, 503);
+    assert.ok(third.headers.get("retry-after"), "rejected stream carries a Retry-After header");
+    await third.json().catch(() => {});
+
+    // Disconnecting an open stream must free its slot so a later stream is admitted again.
+    controllers[0].abort();
+    let admitted = null;
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      const res = await openStream();
+      if (res.status === 200) {
+        admitted = res;
+        break;
+      }
+      await res.json().catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(admitted, "a slot frees up after a stream disconnects");
+  } finally {
+    for (const controller of controllers) controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("many concurrent /api/stream connections do not trip MaxListenersExceededWarning (HIGH regression)", async () => {
+  const warnings = [];
+  const onWarning = (warning) => warnings.push(warning);
+  process.on("warning", onWarning);
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-listeners-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    maxStreamClients: 32,
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const controllers = [];
+  try {
+    await openSession(base, artifact);
+    // Open more streams than Node's default 10-listener-per-event ceiling; each registers a
+    // "feedback" and an "ended" listener on the shared emitter.
+    const responses = await Promise.all(
+      Array.from({ length: 12 }, () => {
+        const controller = new AbortController();
+        controllers.push(controller);
+        return fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+          headers: { accept: "text/event-stream" },
+          signal: controller.signal,
+        });
+      }),
+    );
+    for (const res of responses) assert.equal(res.status, 200);
+    await new Promise((resolve) => setImmediate(resolve));
+    const offenders = warnings.filter((warning) => warning && warning.name === "MaxListenersExceededWarning");
+    assert.equal(
+      offenders.length,
+      0,
+      `MaxListenersExceededWarning fired: ${offenders.map((w) => w.message).join("; ")}`,
+    );
+  } finally {
+    process.off("warning", onWarning);
+    for (const controller of controllers) controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("agent-reply broadcasts a message id and threads via reply_to (change #3)", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-thread-"));
   const artifact = path.join(dir, "artifact.html");
