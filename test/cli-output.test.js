@@ -32,6 +32,7 @@ import {
   shouldRestartServer,
   startPollWaitReporter,
   stopCommand,
+  streamMessageRecord,
   telemetryCommandName,
   VERSION,
 } from "../src/cli.js";
@@ -863,4 +864,36 @@ test("stop command reports when no server is running", async () => {
   } finally {
     await rm(dir, { force: true, recursive: true });
   }
+});
+
+test("streamMessageRecord marks a user-message frame deliverable (MEDIUM regression)", () => {
+  const { record, isUserMessage } = streamMessageRecord({
+    id: "msg-1",
+    prompts: [{ tag: "message", prompt: "make the header bigger", id: "msg-1" }],
+    dom_snapshot: "snap",
+  });
+  assert.equal(isUserMessage, true);
+  assert.equal(record.type, "message");
+  assert.equal(record.text, "make the header bigger");
+  assert.equal(record.id, "msg-1");
+});
+
+test("streamMessageRecord does NOT treat a layout-warning-only frame as a user message (MEDIUM regression)", () => {
+  // A feedback-only batch (no message-tagged prompt) must still be emitted so the agent sees the
+  // warnings, but it is not a delivered user message and must not satisfy/terminate --once.
+  const { record, isUserMessage } = streamMessageRecord({
+    prompts: [],
+    layout_warnings: [{ selector: "html", kind: "page-horizontal-overflow", severity: "error" }],
+  });
+  assert.equal(isUserMessage, false);
+  assert.equal(record.type, "feedback");
+  assert.equal(record.text, "");
+  assert.deepEqual(record.layout_warnings, [{ selector: "html", kind: "page-horizontal-overflow", severity: "error" }]);
+});
+
+test("streamMessageRecord does NOT treat an annotation-only frame as a user message (MEDIUM regression)", () => {
+  const { isUserMessage } = streamMessageRecord({
+    prompts: [{ tag: "h1", prompt: "tighten this", selector: "h1", text: "Title" }],
+  });
+  assert.equal(isUserMessage, false);
 });

@@ -290,21 +290,15 @@ async function streamCommand(args) {
     if (event === "message") {
       const payload = safeJsonParse(data);
       if (!payload) return;
-      const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
-      const message = prompts.find((p) => p && p.tag === "message" && p.prompt) || null;
-      write(
-        JSON.stringify({
-          type: "message",
-          id: payload.id || message?.id || "",
-          ...(payload.reply_to || message?.reply_to ? { reply_to: payload.reply_to || message?.reply_to } : {}),
-          text: message?.prompt || "",
-          prompts,
-          ...(payload.layout_warnings ? { layout_warnings: payload.layout_warnings } : {}),
-          dom_snapshot: payload.dom_snapshot || "",
-        }),
-      );
-      delivered += 1;
-      if (once) stop = true;
+      const { record, isUserMessage } = streamMessageRecord(payload);
+      write(JSON.stringify(record));
+      // Only a real user message counts toward delivery and satisfies --once. Annotation- or
+      // layout-warning-only frames are still emitted (the agent acts on them) but must not
+      // terminate a --once harness before an actual user message arrives.
+      if (isUserMessage) {
+        delivered += 1;
+        if (once) stop = true;
+      }
     } else if (event === "ended") {
       ended = true;
       write(JSON.stringify({ type: "ended", file: absolute }));
@@ -352,6 +346,27 @@ function safeJsonParse(text) {
   } catch {
     return null;
   }
+}
+
+// Build the NDJSON record for one `/api/stream` `message` frame and classify it. A frame is a
+// deliverable user message only when it carries a message-tagged prompt; the server also emits
+// `message` frames for annotation- or layout-warning-only batches (no user message). Those still
+// reach the agent but must not count toward `delivered` or satisfy `--once`. `isUserMessage`
+// captures that distinction so the stream loop treats the two kinds correctly.
+export function streamMessageRecord(payload) {
+  const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
+  const message = prompts.find((p) => p && p.tag === "message" && p.prompt) || null;
+  const replyTo = payload.reply_to || message?.reply_to;
+  const record = {
+    type: message ? "message" : "feedback",
+    id: payload.id || message?.id || "",
+    ...(replyTo ? { reply_to: replyTo } : {}),
+    text: message?.prompt || "",
+    prompts,
+    ...(payload.layout_warnings ? { layout_warnings: payload.layout_warnings } : {}),
+    dom_snapshot: payload.dom_snapshot || "",
+  };
+  return { record, isUserMessage: Boolean(message) };
 }
 
 export function streamBannerText(file) {
