@@ -54,10 +54,22 @@ export class SessionStore {
       return null;
     }
     const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
-    const normalizedPrompts = prompts.map(normalizePrompt);
+    // Give every message-tagged prompt a stable id (change #3) so the same id appears on the
+    // delivered prompt (poll/stream), on the user's chat entry, and as a reply_to target. Mutate
+    // in place so the id persists into session.prompts for the agent to read.
+    const normalizedPrompts = prompts.map(normalizePrompt).map((prompt) => {
+      if (prompt.tag === "message" && prompt.prompt && !prompt.id) prompt.id = newMessageId();
+      return prompt;
+    });
     const userMessages = normalizedPrompts
       .filter((prompt) => prompt.tag === "message" && prompt.prompt)
-      .map((prompt) => ({ role: "user", text: prompt.prompt, at: new Date().toISOString() }));
+      .map((prompt) => ({
+        role: "user",
+        text: prompt.prompt,
+        at: new Date().toISOString(),
+        id: prompt.id,
+        ...(prompt.reply_to ? { reply_to: prompt.reply_to } : {}),
+      }));
     session.prompts = [...(session.prompts || []), ...normalizedPrompts];
     session.chat = [...(session.chat || []), ...userMessages];
     session.pending_prompts = session.prompts.length;
@@ -134,16 +146,24 @@ export class SessionStore {
     return session;
   }
 
-  async addAgentReply(key, text) {
+  async addAgentReply(key, text, options = {}) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
       return null;
     }
-    session.chat = [...(session.chat || []), { role: "agent", text: String(text || ""), at: new Date().toISOString() }];
+    const id = options.id || newMessageId();
+    const message = {
+      role: "agent",
+      text: String(text || ""),
+      at: new Date().toISOString(),
+      id,
+      ...(options.reply_to ? { reply_to: String(options.reply_to) } : {}),
+    };
+    session.chat = [...(session.chat || []), message];
     session.updated_at = new Date().toISOString();
     await this.writeState(state);
-    return session;
+    return { session, message };
   }
 
   async readState() {
@@ -181,9 +201,15 @@ function normalizePrompt(prompt) {
     tag: String(prompt.tag || ""),
     text: String(prompt.text || ""),
   };
+  if (prompt.id) normalized.id = String(prompt.id);
+  if (prompt.reply_to) normalized.reply_to = String(prompt.reply_to);
   const target = normalizeTarget(prompt.target);
   if (target) normalized.target = target;
   return normalized;
+}
+
+export function newMessageId() {
+  return crypto.randomUUID();
 }
 
 function normalizeLayoutWarnings(layoutWarnings) {

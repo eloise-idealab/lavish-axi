@@ -14,7 +14,7 @@ import { serve } from "./server.js";
 import { canonicalFile, sessionKey, SessionStore } from "./session-store.js";
 import { initDefaultTelemetry } from "./telemetry.js";
 
-const COMMANDS = new Set(["open", "poll", "end", "stop", "server", "playbook", "design", "setup"]);
+const COMMANDS = new Set(["open", "poll", "stream", "end", "stop", "server", "playbook", "design", "setup"]);
 // SDK-reserved built-ins (e.g. `update`) must reach runAxiCli untouched; otherwise
 // the bare-arg normalization below would rewrite them into the hidden `open` command.
 const RESERVED = new Set(RESERVED_COMMANDS);
@@ -53,6 +53,7 @@ export async function run(argv) {
       commands: {
         open: openCommand,
         poll: pollCommand,
+        stream: streamCommand,
         end: endCommand,
         stop: stopCommand,
         playbook: playbookCommand,
@@ -227,6 +228,155 @@ async function pollCommand(args) {
       process.off("SIGTERM", onPollSignal);
     }
   }
+}
+
+// Change #1: real-time push delivery. Instead of one poll = one batch = exit, `stream` holds an SSE
+// connection open and prints one NDJSON line per user message as it arrives. The agent reads stdout
+// line-by-line and fans out a subagent per line. Use --once to stop after the first message (useful
+// for tests / harnesses that cannot keep a long-lived process), and --agent-reply to post a reply
+// (optionally threaded with --reply-to <id>) before streaming.
+async function streamCommand(args) {
+  const file = args[0];
+  if (!file) {
+    throw new AxiError("HTML file path is required", "VALIDATION_ERROR", ["Run `lavish-axi stream <html-file>`"]);
+  }
+  const absolute = await canonicalFile(file);
+  const baseUrl = await ensureServer();
+  const agentReply = flagValue(args, "--agent-reply");
+  if (agentReply) {
+    const replyTo = flagValue(args, "--reply-to");
+    await postJson(`${baseUrl}/api/${sessionKey(absolute)}/agent-reply`, {
+      text: agentReply,
+      ...(replyTo ? { reply_to: replyTo } : {}),
+    });
+  }
+  const once = args.includes("--once");
+  const write = (line) => process.stdout.write(`${line}\n`);
+  const url = `${baseUrl}/api/stream?file=${encodeURIComponent(absolute)}`;
+
+  let response;
+  try {
+    response = await fetch(url, { headers: { accept: "text/event-stream" } });
+  } catch {
+    throw serverConnectionError();
+  }
+  if (response.status === 404) {
+    throw new AxiError("No active Lavish Editor session for this file", "NOT_FOUND", [
+      `Run \`lavish-axi ${absolute}\` first`,
+    ]);
+  }
+  if (!response.ok || !response.body) {
+    throw new AxiError(`Lavish Editor stream failed: ${response.status}`, "SERVER_ERROR");
+  }
+
+  const onSignal = (signal) => {
+    process.stderr.write(`\n${streamInterruptedText(absolute)}\n`);
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  process.stderr.write(`${streamBannerText(absolute)}\n`);
+
+  let delivered = 0;
+  let ended = false;
+  // Own the reader explicitly (rather than a for-await generator) so that on --once / "ended" we
+  // can deterministically cancel it and let the socket close, instead of leaving a pending read()
+  // that keeps the process alive.
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let stop = false;
+  const handleFrame = (event, data) => {
+    if (event === "message") {
+      const payload = safeJsonParse(data);
+      if (!payload) return;
+      const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
+      const message = prompts.find((p) => p && p.tag === "message" && p.prompt) || null;
+      write(
+        JSON.stringify({
+          type: "message",
+          id: payload.id || message?.id || "",
+          ...(payload.reply_to || message?.reply_to ? { reply_to: payload.reply_to || message?.reply_to } : {}),
+          text: message?.prompt || "",
+          prompts,
+          ...(payload.layout_warnings ? { layout_warnings: payload.layout_warnings } : {}),
+          dom_snapshot: payload.dom_snapshot || "",
+        }),
+      );
+      delivered += 1;
+      if (once) stop = true;
+    } else if (event === "ended") {
+      ended = true;
+      write(JSON.stringify({ type: "ended", file: absolute }));
+      stop = true;
+    }
+  };
+  try {
+    while (!stop) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary;
+      while (!stop && (boundary = buffer.indexOf("\n\n")) !== -1) {
+        const raw = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        let event = "message";
+        const dataLines = [];
+        for (const line of raw.split("\n")) {
+          if (line.startsWith(":")) continue;
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+        }
+        if (dataLines.length > 0) handleFrame(event, dataLines.join("\n"));
+      }
+    }
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    try {
+      await reader.cancel();
+    } catch {
+      // best effort
+    }
+  }
+  return {
+    session: { file: absolute, status: ended ? "ended" : "streamed" },
+    delivered,
+    next_step: streamNextStep(absolute),
+  };
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+export function streamBannerText(file) {
+  return (
+    `[lavish-axi] Streaming user messages for ${file} over a live push connection. Each user message ` +
+    `prints as one NDJSON line on stdout - read them line-by-line and handle each (e.g. fan out a ` +
+    `subagent per message). This stays open until the session ends or the connection drops; never ` +
+    `kill it. If it drops, re-run \`lavish-axi stream ${file}\` - queued messages are never lost.`
+  );
+}
+
+export function streamInterruptedText(file) {
+  return (
+    `[lavish-axi] Stream interrupted. The user may still be reviewing - re-run ` +
+    `\`lavish-axi stream ${file}\` to keep receiving messages; queued messages are never lost.`
+  );
+}
+
+export function streamNextStep(file) {
+  return (
+    `The stream closed. If the session is not ended, re-run \`lavish-axi stream ${file}\` to keep ` +
+    `receiving messages - queued messages are never lost. Use ` +
+    `\`lavish-axi stream ${file} --agent-reply "<message>" [--reply-to <id>]\` to reply to the user, ` +
+    `threading under a specific message id when relevant.`
+  );
 }
 
 export function pollWaitBannerText(file) {
@@ -672,6 +822,7 @@ const TOP_LEVEL_HELP = `lavish-axi - Lavish Editor AXI\n\nUsage:\n  lavish-axi\n
 const COMMAND_HELP = {
   open: `Usage: lavish-axi <html-file> [--no-open] [--no-gate]\n\nOpen or resume a Lavish Editor review session for an HTML artifact. Use --no-open when you need to ensure the server/session exists without opening another browser window. Use --no-gate to skip the open-time layout curtain for this browser open.\n`,
   poll: `Usage: lavish-axi poll <html-file> [--agent-reply "..."]\n\nThis command long-polls indefinitely for queued user prompts and browser-reported layout_warnings, then returns them to the agent. It stays silent while it waits - that is normal, never kill it. Fix layout_warnings before involving the human. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. If your harness limits how long a foreground command may run, run the poll as a background task and wait for it to finish; if it still gets killed or times out, just re-run it - queued feedback is never lost. Use --agent-reply after applying prior feedback to display your response in Lavish Editor before waiting again.\n`,
+  stream: `Usage: lavish-axi stream <html-file> [--once] [--agent-reply "..." [--reply-to <id>]]\n\nReal-time push alternative to poll. Holds a live connection open and prints one NDJSON line per user message on stdout as each arrives, so you can handle messages individually (e.g. fan out a subagent per message) instead of draining one batch and exiting. Read stdout line-by-line; the stream stays open until the session ends or the connection drops - never kill it, and re-run if it drops (queued messages are never lost). Pass --once to stop after the first message (for harnesses that cannot keep a long-lived process). Use --agent-reply to post a reply before streaming, and --reply-to <id> to thread it under a specific message.\n`,
   end: `Usage: lavish-axi end <html-file>\n\nEnd a Lavish Editor session.\n`,
   stop: `Usage: lavish-axi stop [--port <port>]\n\nShut down the background Lavish Editor server. The server also stops itself when no browser or poll has been connected for a while (LAVISH_AXI_IDLE_TIMEOUT_MS, default 30m) and immediately when the last session ends with nothing connected.\n`,
   playbook: `Usage: lavish-axi playbook [playbook_id]\n\nList focused artifact guidance playbooks, or show one playbook by ID. Known IDs: diagram, table, comparison, plan, code, input, slides.\n\n${PLAYBOOK_ROUTER_HELP}\n\nExamples:\n  lavish-axi playbook\n  lavish-axi playbook diagram\n  lavish-axi playbook input\n`,

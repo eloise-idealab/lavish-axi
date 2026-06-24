@@ -300,3 +300,32 @@ test("freeform user prompts are stored in session chat history", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("user and agent messages get stable ids and carry reply_to for threading (change #3)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-thread-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+
+    const { message: agentMessage } = await store.addAgentReply(session.key, "Draft ready");
+    assert.ok(typeof agentMessage.id === "string" && agentMessage.id.length > 0);
+
+    await store.queuePrompts(session.key, {
+      prompts: [{ tag: "message", prompt: "Tweak the heading", reply_to: agentMessage.id }],
+    });
+    const updated = await store.findByKey(session.key);
+    const userMsg = updated.chat.find((m) => m.role === "user");
+    assert.ok(typeof userMsg.id === "string" && userMsg.id.length > 0, "user message has an id");
+    assert.equal(userMsg.reply_to, agentMessage.id, "user message threads under the agent message");
+
+    // takeFeedback preserves the reply_to on the delivered prompt.
+    const feedback = feedbackResult(await store.takeFeedback(session.key));
+    const delivered = feedback.prompts.find((p) => p.tag === "message");
+    assert.equal(delivered.reply_to, agentMessage.id);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

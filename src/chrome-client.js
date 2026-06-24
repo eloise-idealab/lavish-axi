@@ -43,6 +43,13 @@ let annotation = true;
 let ended = false;
 let agentPresence = "waiting";
 let pendingSnapshot = "";
+// Change #3 (threading): id of the agent message the next user message replies to ("" = no thread),
+// and a lookup of rendered agent message text by id for the quoted-snippet preview.
+let replyToId = "";
+const chatMessages = new Map();
+const replyIndicator = /** @type {HTMLDivElement} */ (document.getElementById("replyIndicator"));
+const replyIndicatorText = /** @type {HTMLSpanElement} */ (document.getElementById("replyIndicatorText"));
+const replyIndicatorClear = /** @type {HTMLButtonElement} */ (document.getElementById("replyIndicatorClear"));
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
 const layoutGateMaxHoldMs =
@@ -129,8 +136,11 @@ function render() {
 }
 
 function updateSendState() {
-  sendButton.disabled = ended || agentPresence === "working";
-  sendCaret.disabled = ended || agentPresence === "working";
+  // Change #2: the Send button (and in-page chat input) are never disabled just because the agent
+  // is "working". A queued/streamed message is always accepted and delivered, so blocking the UI
+  // mid-task only adds friction. Still disable on a genuinely ended session.
+  sendButton.disabled = ended;
+  sendCaret.disabled = ended;
   sendFromMenuButton.disabled = sendButton.disabled;
 }
 
@@ -184,14 +194,62 @@ async function copyText(text) {
   return true;
 }
 
-function addChat(role, text) {
+function addChat(role, text, meta = {}) {
   if (!text) return;
 
   const el = document.createElement("div");
   el.className = "bubble " + role;
-  el.innerHTML = "<small>" + (role === "agent" ? "Agent" : "You") + "</small><div>" + escapeHtml(text) + "</div>";
+  if (meta.id) {
+    el.dataset.messageId = String(meta.id);
+    if (role === "agent") chatMessages.set(String(meta.id), text);
+  }
+  // Change #3 (threading): show which earlier message this one replies to, as a quoted snippet.
+  let threadHtml = "";
+  if (meta.reply_to) {
+    const quoted = chatMessages.get(String(meta.reply_to));
+    if (quoted) {
+      threadHtml = '<div class="reply-quote">' + escapeHtml(truncateQuote(quoted)) + "</div>";
+    }
+  }
+  // Agent bubbles get a Reply affordance so the user can thread a response to that specific message.
+  const replyHtml =
+    role === "agent" && meta.id
+      ? '<button class="reply-button" type="button" data-reply-id="' + escapeHtml(String(meta.id)) + '">Reply</button>'
+      : "";
+  el.innerHTML =
+    "<small>" +
+    (role === "agent" ? "Agent" : "You") +
+    "</small>" +
+    threadHtml +
+    "<div>" +
+    escapeHtml(text) +
+    "</div>" +
+    replyHtml;
+  const replyButton = el.querySelector(".reply-button");
+  if (replyButton) {
+    replyButton.addEventListener("click", () => setReplyTarget(String(meta.id), text));
+  }
   chatLog.appendChild(el);
   chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function truncateQuote(text) {
+  const trimmed = String(text).replace(/\s+/g, " ").trim();
+  return trimmed.length > 120 ? trimmed.slice(0, 117) + "..." : trimmed;
+}
+
+function setReplyTarget(id, text) {
+  replyToId = id;
+  if (replyIndicator) {
+    replyIndicatorText.textContent = truncateQuote(text);
+    replyIndicator.hidden = false;
+  }
+  chatInput.focus();
+}
+
+function clearReplyTarget() {
+  replyToId = "";
+  if (replyIndicator) replyIndicator.hidden = true;
 }
 
 function syncChat(chat) {
@@ -199,7 +257,8 @@ function syncChat(chat) {
     el.remove();
   }
 
-  for (const item of chat) addChat(item.role, item.text);
+  chatMessages.clear();
+  for (const item of chat) addChat(item.role, item.text, { id: item.id, reply_to: item.reply_to });
   if (workingBubble) chatLog.appendChild(workingBubble);
   chatLog.scrollTop = chatLog.scrollHeight;
 }
@@ -271,14 +330,23 @@ function requestSnapshot(action) {
 }
 
 function sendQueued(endAfter) {
-  if (ended || agentPresence === "working") return;
+  // Change #2: only an ended session blocks sending; "working" no longer early-returns, so a stream
+  // of messages can be fired while the agent is still acting on the previous one.
+  if (ended) return;
   closeMenus();
 
   const text = chatInput.value.trim();
   if (text) {
-    queued.push({ uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" });
+    const message = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
+    // Change #3 (threading): if the user is replying to a specific agent bubble, carry its id so the
+    // agent receives `reply_to` and the transcript renders the message under that thread.
+    if (replyToId) {
+      message.reply_to = replyToId;
+    }
+    queued.push(message);
     persistQueuedPrompts();
-    addChat("user", text);
+    addChat("user", text, { reply_to: replyToId });
+    clearReplyTarget();
     chatInput.value = "";
     render();
   }
@@ -598,10 +666,15 @@ initializeLayoutGate();
 const events = new EventSource("/events/" + key);
 events.addEventListener("reload", () => resetFrame());
 events.addEventListener("chrome-reload", () => reloadAfterServerRestart());
-events.addEventListener("agent-reply", (event) => addChat("agent", JSON.parse(event.data).text));
+events.addEventListener("agent-reply", (event) => {
+  const data = JSON.parse(event.data);
+  addChat("agent", data.text, { id: data.id, reply_to: data.reply_to });
+});
 events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
 events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
 
+if (replyIndicatorClear) replyIndicatorClear.onclick = () => clearReplyTarget();
+
 render();
-initialChat.forEach((item) => addChat(item.role, item.text));
+initialChat.forEach((item) => addChat(item.role, item.text, { id: item.id, reply_to: item.reply_to }));
 setAgentPresence("waiting");

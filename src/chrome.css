@@ -512,6 +512,81 @@ body.lavish {
     transform: rotate(360deg);
   }
 }
+/* Threading (change #3): reply affordance on agent bubbles, quoted snippet on threaded messages,
+   and the "Replying to:" indicator above the composer. */
+.bubble {
+  position: relative;
+}
+.reply-button {
+  margin-top: 6px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: var(--w-bold);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  background: transparent;
+  border: var(--hairline-subtle);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.bubble.agent:hover .reply-button,
+.reply-button:focus-visible {
+  opacity: 1;
+}
+.reply-button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.reply-quote {
+  margin-bottom: 6px;
+  padding: 4px 8px;
+  border-left: 2px solid var(--accent);
+  background: var(--bg-elevated);
+  border-radius: var(--radius-md, 6px);
+  color: var(--fg-muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.reply-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--accent);
+  background: var(--bg-elevated);
+  border-radius: var(--radius-md, 6px);
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.reply-indicator-label {
+  font-weight: var(--w-bold);
+  color: var(--fg-faint);
+  flex: 0 0 auto;
+}
+.reply-indicator-text {
+  flex: 1 1 auto;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.reply-indicator-clear {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  line-height: 1;
+  font-size: 14px;
+  color: var(--fg-faint);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  border-radius: var(--radius-pill);
+}
+.reply-indicator-clear:hover {
+  color: var(--accent);
+}
 .composer {
   display: grid;
   gap: 8px;

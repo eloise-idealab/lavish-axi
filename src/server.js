@@ -180,6 +180,110 @@ export async function serve({
     }
   });
 
+  // Agent-facing push stream (change #1). Unlike /api/poll, which drains one batch and ends the
+  // response, this holds the connection open forever and emits each queued message as its own SSE
+  // `data:` frame as soon as it arrives. The agent consumes this with `lavish-axi stream <file>`
+  // and fans out a subagent per frame. An open stream counts as a live poll for presence, so the
+  // browser sees "listening" and the Send button stays active (folds in change #2 naturally).
+  app.get("/api/stream", async (req, res, next) => {
+    try {
+      const file = await canonicalFile(String(req.query.file || ""));
+      const key = sessionKey(file);
+      const session = await store.findByKey(key);
+      if (!session) {
+        res.status(404).json({ status: "missing" });
+        return;
+      }
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      // Each emitted frame is `event: <name>\ndata: <json>\n\n`.
+      const writeFrame = (event, data) => {
+        if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      };
+      setPollActive(key, activePolls, deliveredFeedback, events, true);
+      refreshIdleTimer();
+      writeFrame("ready", { file });
+
+      let draining = false;
+      let drainAgain = false;
+      const drain = async () => {
+        // Serialize drains so two near-simultaneous "feedback" events can't double-take the queue;
+        // re-run once if another event lands mid-drain.
+        if (draining) {
+          drainAgain = true;
+          return;
+        }
+        draining = true;
+        try {
+          let result = await store.takeFeedback(key);
+          while (result.status === "feedback") {
+            markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+            const feedback = /** @type {{ prompts?: any[], layout_warnings?: any[], dom_snapshot?: string }} */ (
+              result
+            );
+            const prompts = Array.isArray(feedback.prompts) ? feedback.prompts : [];
+            const layoutWarnings = Array.isArray(feedback.layout_warnings) ? feedback.layout_warnings : [];
+            // One SSE frame per user message keeps the "one subagent per message" contract; layout
+            // warnings (and any non-message prompts) ride along on the batch's first frame.
+            const messages = prompts.filter((p) => p && p.tag === "message" && p.prompt);
+            const extras = prompts.filter((p) => !(p && p.tag === "message" && p.prompt));
+            if (messages.length === 0 && (extras.length > 0 || layoutWarnings.length > 0)) {
+              writeFrame("message", {
+                prompts: extras,
+                ...(layoutWarnings.length > 0 ? { layout_warnings: layoutWarnings } : {}),
+                dom_snapshot: feedback.dom_snapshot || "",
+              });
+            } else {
+              messages.forEach((message, index) => {
+                writeFrame("message", {
+                  prompts: [message, ...(index === 0 ? extras : [])],
+                  ...(index === 0 && layoutWarnings.length > 0 ? { layout_warnings: layoutWarnings } : {}),
+                  dom_snapshot: index === 0 ? feedback.dom_snapshot || "" : "",
+                  id: message.id || "",
+                  ...(message.reply_to ? { reply_to: message.reply_to } : {}),
+                });
+              });
+            }
+            result = await store.takeFeedback(key);
+          }
+          if (result.status === "ended") writeFrame("ended", { file });
+        } finally {
+          draining = false;
+          if (drainAgain) {
+            drainAgain = false;
+            drain().catch(() => {});
+          }
+        }
+      };
+
+      const onFeedback = (changedKey) => {
+        if (changedKey === key) drain().catch(() => {});
+      };
+      events.on("feedback", onFeedback);
+      events.on("ended", onFeedback);
+      // Drain anything already queued before the stream opened.
+      drain().catch(() => {});
+
+      const heartbeat = setInterval(() => {
+        if (!res.writableEnded) res.write(": keep-alive\n\n");
+      }, pollHeartbeatMs);
+      heartbeat.unref?.();
+
+      req.on("close", () => {
+        clearInterval(heartbeat);
+        events.off("feedback", onFeedback);
+        events.off("ended", onFeedback);
+        setPollActive(key, activePolls, deliveredFeedback, events, false);
+        refreshIdleTimer();
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/:key/prompts", async (req, res, next) => {
     try {
       const session = await store.queuePrompts(req.params.key, req.body || {});
@@ -225,13 +329,14 @@ export async function serve({
   app.post("/api/:key/agent-reply", async (req, res, next) => {
     try {
       const text = String(req.body?.text || "");
-      const session = await store.addAgentReply(req.params.key, text);
-      if (!session) {
+      const replyTo = req.body?.reply_to ? String(req.body.reply_to) : "";
+      const result = await store.addAgentReply(req.params.key, text, replyTo ? { reply_to: replyTo } : {});
+      if (!result) {
         res.status(404).json({ error: "session not found" });
         return;
       }
-      events.emit("agent-reply", req.params.key, text);
-      res.json({ status: "sent" });
+      events.emit("agent-reply", req.params.key, result.message);
+      res.json({ status: "sent", id: result.message.id });
     } catch (error) {
       next(error);
     }
@@ -320,9 +425,12 @@ export async function serve({
           res.write("event: reload\ndata: {}\n\n");
         }
       };
-      const sendAgentReply = (key, text) => {
+      const sendAgentReply = (key, message) => {
         if (key === req.params.key) {
-          res.write(`event: agent-reply\ndata: ${JSON.stringify({ text })}\n\n`);
+          // `message` is the persisted chat entry ({ role, text, at, id, reply_to? }); forward the
+          // whole object so the browser can tag the bubble with its id for reply-threading.
+          const payload = typeof message === "string" ? { text: message } : message;
+          res.write(`event: agent-reply\ndata: ${JSON.stringify(payload)}\n\n`);
         }
       };
       const sendPresence = (key, state) => {
@@ -696,7 +804,7 @@ export function createChromeHtml(session, { layoutGateEnabled = true } = {}) {
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface may have layout issues. Your agent has been notified.</div></div><aside class="panel"><h2>Conversation</h2><div class="chat" id="chatLog"></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><div class="annotation-pills" id="annotationPills"></div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="actions" id="sendActions"><span class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</span><div class="split"><button class="button send-main" id="send">Send to Agent</button><button class="button send-caret" id="sendCaret" type="button" title="Send options" aria-haspopup="menu" aria-expanded="false">${chromeIcons.caret}</button></div><div class="menu send-menu" id="sendMenu" hidden><button class="menu-item" id="sendFromMenu" type="button">${chromeIcons.send}<span>Send to Agent</span></button><button class="menu-item danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; end session</span></button></div></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface may have layout issues. Your agent has been notified.</div></div><aside class="panel"><h2>Conversation</h2><div class="chat" id="chatLog"></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><div class="annotation-pills" id="annotationPills"></div><div class="reply-indicator" id="replyIndicator" hidden><span class="reply-indicator-label">Replying to:</span><span class="reply-indicator-text" id="replyIndicatorText"></span><button class="reply-indicator-clear" id="replyIndicatorClear" type="button" title="Cancel reply">&times;</button></div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="actions" id="sendActions"><span class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</span><div class="split"><button class="button send-main" id="send">Send to Agent</button><button class="button send-caret" id="sendCaret" type="button" title="Send options" aria-haspopup="menu" aria-expanded="false">${chromeIcons.caret}</button></div><div class="menu send-menu" id="sendMenu" hidden><button class="menu-item" id="sendFromMenu" type="button">${chromeIcons.send}<span>Send to Agent</span></button><button class="menu-item danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; end session</span></button></div></div></div></aside></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>
 <script id="lavish-session" type="application/json">${sessionJson}</script>

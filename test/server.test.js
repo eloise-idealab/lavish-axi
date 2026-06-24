@@ -479,13 +479,17 @@ test("chrome shows agent working state when a previous poll has released", async
   assert.match(js, /spinner/);
 });
 
-test("chrome disables sending only while working or ended", async () => {
+test("chrome disables sending only while ended, never while working (change #2)", async () => {
   const js = await chromeClientSource();
 
   assert.match(js, /let agentPresence = "waiting"/);
   assert.match(js, /function updateSendState\(\)/);
-  assert.match(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
-  assert.match(js, /sendCaret\.disabled = ended \|\| agentPresence === "working"/);
+  // Change #2: the Send button / chat input are gated only by `ended`, not by "working".
+  assert.match(js, /sendButton\.disabled = ended;/);
+  assert.match(js, /sendCaret\.disabled = ended;/);
+  assert.doesNotMatch(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
+  // The sendQueued early-return guard must no longer block on "working" either.
+  assert.doesNotMatch(js, /if \(ended \|\| agentPresence === "working"\) return;/);
   assert.doesNotMatch(js, /hasContent/);
 });
 
@@ -1775,4 +1779,169 @@ test("chrome client chat input sends on Enter and inserts newline on Shift+Enter
   assert.match(js, /event\.key === ["']Enter["'] && !event\.shiftKey/);
   assert.match(js, /event\.preventDefault\(\)/);
   assert.match(js, /sendQueued\(\)/);
+});
+
+async function openSession(base, artifact) {
+  const res = await fetch(`${base}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ file: artifact }),
+  });
+  return res.json();
+}
+
+// Reads SSE frames from a fetch body stream until `predicate(frames)` is satisfied or it times out.
+async function collectSseFrames(body, predicate, timeoutMs = 2000) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const frames = [];
+  let buffer = "";
+  const deadline = Date.now() + timeoutMs;
+  try {
+    while (Date.now() < deadline) {
+      const remaining = Math.max(1, deadline - Date.now());
+      const { value, done } = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ value: undefined, done: false }), remaining)),
+      ]);
+      if (done) break;
+      if (value) buffer += decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+        const raw = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        let event = "message";
+        const dataLines = [];
+        for (const line of raw.split("\n")) {
+          if (line.startsWith(":")) continue;
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+        }
+        if (dataLines.length > 0) frames.push({ event, data: JSON.parse(dataLines.join("\n")) });
+      }
+      if (predicate(frames)) break;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return frames;
+}
+
+test("GET /api/stream pushes each queued user message as its own SSE frame (change #1)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+
+    const streamRes = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    assert.equal(streamRes.status, 200);
+    assert.match(streamRes.headers.get("content-type") || "", /text\/event-stream/);
+
+    // Send two messages; each must arrive as a separate `message` frame without re-requesting.
+    for (const text of ["first message", "second message"]) {
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompts: [{ tag: "message", prompt: text }] }),
+      });
+    }
+
+    const frames = await collectSseFrames(
+      streamRes.body,
+      (all) => all.filter((f) => f.event === "message").length >= 2,
+    );
+    const messages = frames.filter((f) => f.event === "message");
+    assert.ok(messages.length >= 2, `expected >= 2 message frames, got ${messages.length}`);
+    const texts = messages.map((f) => f.data.prompts.find((p) => p.tag === "message")?.prompt);
+    assert.ok(texts.includes("first message"));
+    assert.ok(texts.includes("second message"));
+    // Each delivered message carries a stable id for threading (change #3).
+    assert.ok(messages.every((f) => typeof f.data.id === "string" && f.data.id.length > 0));
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an open /api/stream connection reports presence as listening (folds in change #2)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-presence-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+    const presence = await startPresenceStream(base, key);
+    assert.equal(await presence.next(), "waiting");
+    const streamRes = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    assert.equal(streamRes.status, 200);
+    assert.equal(await presence.next(), "listening");
+    await presence.close();
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("agent-reply broadcasts a message id and threads via reply_to (change #3)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-thread-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+    const replyRes = await fetch(`${base}/api/${key}/agent-reply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "Here is the draft." }),
+    });
+    const replyBody = await replyRes.json();
+    assert.equal(replyBody.status, "sent");
+    assert.ok(typeof replyBody.id === "string" && replyBody.id.length > 0, "agent-reply returns the message id");
+
+    // A user message threaded under that id must persist the reply_to on the user chat entry.
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ tag: "message", prompt: "Change the title", reply_to: replyBody.id }] }),
+    });
+    const sessionRes = await fetch(`${base}/session/${key}`);
+    assert.equal(sessionRes.status, 200);
+    const state = JSON.parse(await readFile(path.join(dir, "state.json"), "utf8"));
+    const chat = state.sessions[key].chat;
+    const userMsg = chat.find((m) => m.role === "user" && m.text === "Change the title");
+    assert.ok(userMsg, "user message persisted");
+    assert.equal(userMsg.reply_to, replyBody.id, "user message threaded under the agent message id");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("chrome client renders reply affordance and threading (change #3)", async () => {
+  const js = await chromeClientSource();
+  const css = await chromeCssSource();
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+
+  assert.match(js, /let replyToId = ""/);
+  assert.match(js, /function setReplyTarget\(/);
+  assert.match(js, /class="reply-button"/);
+  assert.match(js, /message\.reply_to = replyToId/);
+  assert.match(html, /id="replyIndicator"/);
+  assert.match(css, /\.reply-button\{/);
+  assert.match(css, /\.reply-indicator\{/);
 });
