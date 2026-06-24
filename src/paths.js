@@ -16,6 +16,12 @@ const WILDCARD_BIND_LOOPBACK = new Map([
 
 // Address the server binds to (LAVISH_AXI_HOST). Defaults to loopback. A wildcard value
 // (0.0.0.0 or ::) binds every interface.
+//
+// SECURITY: every Lavish endpoint is unauthenticated and is meant for the loopback default, where
+// only the local machine can reach it. The /api/stream cap bounds resource use, but there is no
+// auth or origin check. Binding beyond loopback exposes the whole control surface (queue feedback,
+// read artifact files, stream sessions) to any reachable client. Only do so on a trusted network,
+// and prefer fronting it with a reverse proxy that adds authentication.
 export function bindHost(env = process.env) {
   return env.LAVISH_AXI_HOST?.trim() || LOOPBACK_HOST;
 }
