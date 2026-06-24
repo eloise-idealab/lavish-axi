@@ -550,6 +550,7 @@ body.lavish {
   font-size: 11px;
   line-height: 1.35;
 }
+.reply-indicator[hidden] { display: none; }
 .reply-indicator {
   display: flex;
   align-items: center;
