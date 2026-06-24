@@ -85,11 +85,15 @@ export class SessionStore {
         return null;
       }
       const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
-      // Give every message-tagged prompt a stable id (change #3) so the same id appears on the
-      // delivered prompt (poll/stream), on the user's chat entry, and as a reply_to target. Mutate
-      // in place so the id persists into session.prompts for the agent to read.
+      // Message ids and reply targets are server-owned (change #3): always mint the id here so a
+      // caller can't forge or duplicate one through the unauthenticated local API, and drop any
+      // reply_to that doesn't point at a message already in this session's transcript so threads
+      // can't be spoofed. The id is mutated in place so it persists onto session.prompts for the
+      // agent, the user's chat entry, and as a future reply_to target.
+      const knownMessageIds = new Set((session.chat || []).map((entry) => entry.id).filter(Boolean));
       const normalizedPrompts = prompts.map(normalizePrompt).map((prompt) => {
-        if (prompt.tag === "message" && prompt.prompt && !prompt.id) prompt.id = newMessageId();
+        if (prompt.tag === "message" && prompt.prompt) prompt.id = newMessageId();
+        if (prompt.reply_to && !knownMessageIds.has(prompt.reply_to)) delete prompt.reply_to;
         return prompt;
       });
       const userMessages = normalizedPrompts
@@ -192,12 +196,16 @@ export class SessionStore {
         return null;
       }
       const id = options.id || newMessageId();
+      // Only thread under a reply target that already exists in this session; ignore an unknown or
+      // forged reply_to rather than render a misleading thread.
+      const knownMessageIds = new Set((session.chat || []).map((entry) => entry.id).filter(Boolean));
+      const replyTo = options.reply_to && knownMessageIds.has(String(options.reply_to)) ? String(options.reply_to) : "";
       const message = {
         role: "agent",
         text: String(text || ""),
         at: new Date().toISOString(),
         id,
-        ...(options.reply_to ? { reply_to: String(options.reply_to) } : {}),
+        ...(replyTo ? { reply_to: replyTo } : {}),
       };
       session.chat = [...(session.chat || []), message];
       session.updated_at = new Date().toISOString();

@@ -377,3 +377,86 @@ test("user and agent messages get stable ids and carry reply_to for threading (c
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("queuePrompts assigns server-side message ids and ignores caller-supplied ids (MEDIUM regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-id-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    // A caller-forged id (and a duplicate of it) must not become the message id: the server owns ids.
+    await store.queuePrompts(session.key, {
+      prompts: [
+        { tag: "message", prompt: "first", id: "forged-1" },
+        { tag: "message", prompt: "second", id: "forged-1" },
+      ],
+    });
+
+    const updated = await store.findByKey(session.key);
+    const userMsgs = updated.chat.filter((m) => m.role === "user");
+    assert.equal(userMsgs.length, 2);
+    for (const msg of userMsgs) {
+      assert.notEqual(msg.id, "forged-1", "server ignores the caller-supplied id");
+      assert.match(msg.id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    }
+    assert.notEqual(userMsgs[0].id, userMsgs[1].id, "duplicate forged ids resolve to distinct server ids");
+
+    // The delivered prompt carries the same server id as the chat entry.
+    const feedback = feedbackResult(await store.takeFeedback(session.key));
+    const deliveredIds = feedback.prompts.filter((p) => p.tag === "message").map((p) => p.id);
+    assert.deepEqual([...deliveredIds].sort(), [...userMsgs.map((m) => m.id)].sort());
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("queuePrompts drops a reply_to that targets no known message (MEDIUM regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-reply-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.queuePrompts(session.key, {
+      prompts: [{ tag: "message", prompt: "reply to a ghost", reply_to: "does-not-exist" }],
+    });
+
+    const updated = await store.findByKey(session.key);
+    const userMsg = updated.chat.find((m) => m.role === "user");
+    assert.equal(userMsg.reply_to, undefined, "unknown reply_to is stripped from the chat entry");
+    const feedback = feedbackResult(await store.takeFeedback(session.key));
+    const delivered = feedback.prompts.find((p) => p.tag === "message");
+    assert.equal(delivered.reply_to, undefined, "unknown reply_to is stripped from the delivered prompt");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("addAgentReply drops an unknown reply_to but keeps a valid one (MEDIUM regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-areply-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    // A user message exists; replying to it threads, replying to a ghost does not.
+    await store.queuePrompts(session.key, { prompts: [{ tag: "message", prompt: "the question" }] });
+    const afterUser = await store.findByKey(session.key);
+    const userId = afterUser.chat.find((m) => m.role === "user").id;
+
+    const ghost = await store.addAgentReply(session.key, "answering nothing", { reply_to: "ghost-id" });
+    assert.equal(ghost.message.reply_to, undefined, "unknown reply_to is stripped");
+
+    const threaded = await store.addAgentReply(session.key, "answering the question", { reply_to: userId });
+    assert.equal(threaded.message.reply_to, userId, "valid reply_to is preserved");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
