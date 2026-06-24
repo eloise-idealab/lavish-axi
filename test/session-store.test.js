@@ -301,6 +301,54 @@ test("freeform user prompts are stored in session chat history", async () => {
   }
 });
 
+test("concurrent takeFeedback and queuePrompts never drop or duplicate messages (BLOCKER regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-race-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+
+    const collect = (result, into) => {
+      if (result.status === "feedback") {
+        for (const prompt of result.prompts) if (prompt.tag === "message") into.push(prompt.prompt);
+      }
+    };
+    const drainAll = async (into) => {
+      let next = await store.takeFeedback(session.key);
+      while (next.status === "feedback") {
+        collect(next, into);
+        next = await store.takeFeedback(session.key);
+      }
+    };
+
+    // Race a stream drain (takeFeedback) against an always-on Send (queuePrompts) many times. The
+    // un-serialized read-modify-write loses or duplicates a message in at least one iteration; a
+    // serialized store always delivers each message exactly once.
+    for (let i = 0; i < 30; i++) {
+      await drainAll([]); // clear any residue from a previous iteration
+      await store.queuePrompts(session.key, { prompts: [{ tag: "message", prompt: "A" }] });
+
+      const delivered = [];
+      const drain = store.takeFeedback(session.key);
+      const send = store.queuePrompts(session.key, { prompts: [{ tag: "message", prompt: "B" }] });
+      const [drainResult] = await Promise.all([drain, send]);
+      collect(drainResult, delivered);
+      await drainAll(delivered);
+
+      assert.deepEqual(
+        [...delivered].sort(),
+        ["A", "B"],
+        `iteration ${i}: messages dropped or duplicated -> ${JSON.stringify(delivered)}`,
+      );
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("user and agent messages get stable ids and carry reply_to for threading (change #3)", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-thread-"));
   try {
