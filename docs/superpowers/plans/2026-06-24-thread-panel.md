@@ -25,12 +25,14 @@
 Establish the tested, DOM-free core. No rendering yet.
 
 **Files:**
+
 - Modify: `src/chrome-client.js` (add helpers after `renderInlineMarkdown`, ~line 101; add a test seam at the end, ~line 689)
 - Create: `test/helpers/chrome-harness.js` (extract the existing harness so two test files can share it)
 - Modify: `test/chrome-client-queue.test.js` (import the shared harness instead of defining it inline)
 - Create: `test/chrome-client-threading.test.js`
 
 **Interfaces:**
+
 - Produces (all pure, defined in `chrome-client.js`):
   - `resolveRootId(id: string, byId: Map<string, Msg>): string`
   - `groupThreads(messages: Msg[]): { roots: Msg[], repliesByRoot: Map<string, Msg[]> }`
@@ -63,7 +65,11 @@ In the returned object (alongside `element`, `frame`, …), add:
 And add `export` to both declarations:
 
 ```js
-export async function createChromeHarness({ /* …unchanged… */ } = {}) { /* … */ }
+export async function createChromeHarness({
+  /* …unchanged… */
+} = {}) {
+  /* … */
+}
 export function flushPromises() {
   return new Promise((resolve) => setImmediate(resolve));
 }
@@ -327,10 +333,12 @@ git commit -m "feat(ui): pure threading helpers (root resolve, grouping, chip, b
 Add the markup the client will drive. Behavior comes later; this task just makes the structure (and its element ids) exist.
 
 **Files:**
+
 - Modify: `src/server.js` (`createChromeHtml`, the `<aside class="panel">…</aside>` block on line 941)
 - Modify: `test/server.test.js` (add a scaffold assertion)
 
 **Interfaces:**
+
 - Produces these element ids for later tasks: `chatPane`, `threadPane`, `threadBack`, `backBadge`, `threadTitle`, `threadChat`, `threadInput`, `threadSend`, `threadReplyIndicator`, `threadReplyIndicatorText`, `threadReplyIndicatorClear`. Keeps existing ids: `chatLog`, `chatInput`, `send`, `sendActions`, `sendMenu`, `presenceBanner`, `annotationPills`.
 
 - [ ] **Step 1: Write the failing scaffold test**
@@ -362,7 +370,68 @@ Expected: FAIL — the new ids are not in the HTML.
 In `src/server.js`, replace the entire `<aside class="panel">…</aside>` substring on line 941 with the following (it wraps the existing chat + composer in `<div class="chat-pane" id="chatPane">`, removes the old `reply-indicator` from the main composer, and appends the `thread-pane`):
 
 ```html
-<aside class="panel"><div class="chat-pane" id="chatPane"><h2>Conversation</h2><div class="chat" id="chatLog"></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><div class="annotation-pills" id="annotationPills"></div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="actions" id="sendActions"><span class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</span><div class="split"><button class="button send-main" id="send">Send to Agent</button><button class="button send-caret" id="sendCaret" type="button" title="Send options" aria-haspopup="menu" aria-expanded="false">${chromeIcons.caret}</button></div><div class="menu send-menu" id="sendMenu" hidden><button class="menu-item" id="sendFromMenu" type="button">${chromeIcons.send}<span>Send to Agent</span></button><button class="menu-item danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; end session</span></button></div></div></div></div><div class="thread-pane" id="threadPane"><div class="thread-head"><button class="thread-back" id="threadBack" type="button">&lsaquo; Back<span class="back-badge" id="backBadge" hidden></span></button><span class="thread-title" id="threadTitle">Thread</span></div><div class="chat thread-chat" id="threadChat"></div><div class="composer"><div class="reply-indicator" id="threadReplyIndicator" hidden><span class="reply-indicator-label">Replying to:</span><span class="reply-indicator-text" id="threadReplyIndicatorText"></span><button class="reply-indicator-clear" id="threadReplyIndicatorClear" type="button" title="Reply to the whole thread">&times;</button></div><textarea id="threadInput" placeholder="Reply in thread..."></textarea><div class="actions"><div class="split"><button class="button send-main" id="threadSend">Reply</button></div></div></div></div></aside>
+<aside class="panel">
+  <div class="chat-pane" id="chatPane">
+    <h2>Conversation</h2>
+    <div class="chat" id="chatLog"></div>
+    <div class="composer">
+      <div class="presence-banner" id="presenceBanner" hidden>
+        Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.
+      </div>
+      <div class="annotation-pills" id="annotationPills"></div>
+      <textarea id="chatInput" placeholder="Write a message for the agent..."></textarea>
+      <div class="actions" id="sendActions">
+        <span class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</span>
+        <div class="split">
+          <button class="button send-main" id="send">Send to Agent</button
+          ><button
+            class="button send-caret"
+            id="sendCaret"
+            type="button"
+            title="Send options"
+            aria-haspopup="menu"
+            aria-expanded="false"
+          >
+            ${chromeIcons.caret}
+          </button>
+        </div>
+        <div class="menu send-menu" id="sendMenu" hidden>
+          <button class="menu-item" id="sendFromMenu" type="button">
+            ${chromeIcons.send}<span>Send to Agent</span></button
+          ><button class="menu-item danger" id="sendAndEnd" type="button">
+            ${chromeIcons.exit}<span>Send &amp; end session</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="thread-pane" id="threadPane">
+    <div class="thread-head">
+      <button class="thread-back" id="threadBack" type="button">
+        &lsaquo; Back<span class="back-badge" id="backBadge" hidden></span></button
+      ><span class="thread-title" id="threadTitle">Thread</span>
+    </div>
+    <div class="chat thread-chat" id="threadChat"></div>
+    <div class="composer">
+      <div class="reply-indicator" id="threadReplyIndicator" hidden>
+        <span class="reply-indicator-label">Replying to:</span
+        ><span class="reply-indicator-text" id="threadReplyIndicatorText"></span
+        ><button
+          class="reply-indicator-clear"
+          id="threadReplyIndicatorClear"
+          type="button"
+          title="Reply to the whole thread"
+        >
+          &times;
+        </button>
+      </div>
+      <textarea id="threadInput" placeholder="Reply in thread..."></textarea>
+      <div class="actions">
+        <div class="split"><button class="button send-main" id="threadSend">Reply</button></div>
+      </div>
+    </div>
+  </div>
+</aside>
 ```
 
 Note: the old `replyIndicator`/`replyIndicatorText`/`replyIndicatorClear` ids are intentionally gone from the main composer (replies now happen in the thread). Task 5 removes their now-dead references in `chrome-client.js`.
@@ -387,6 +456,7 @@ git commit -m "feat(ui): thread-pane scaffold in chrome HTML (chat-pane + thread
 Style the two panes, the slide-out, the thread chip, the Back button + badge. CSS is verified visually (Task 8), so this task has no unit test; keep it self-contained and commit.
 
 **Files:**
+
 - Modify: `src/chrome.css` (the `.panel` block ~line 440 and the threading block ~line 515)
 
 - [ ] **Step 1: Make the panel a positioning context for the slide-out**
@@ -539,9 +609,11 @@ Replace the flat renderer with the threaded model and wire the slide-out.
 > **Coupling note:** Tasks 4 and 5 jointly rewrite `chrome-client.js`'s chat/compose logic and are executed by a single implementer dispatch. Task 4 in isolation would not lint-clean, because removing the `replyToId`/`clearReplyTarget` declarations (Step 1/2) leaves the old `sendQueued` referencing them until Task 5's `sendQueued` rewrite. When implementing, apply Task 4 then Task 5 and ensure each commit passes `npm run check` — in practice the `sendQueued` rewrite (Task 5, Step 4) and the dead `replyIndicatorClear` wiring removal (Task 5, Step 5) must land in the SAME commit as the Task 4 state-block/render changes that orphan those symbols.
 
 **Files:**
+
 - Modify: `src/chrome-client.js` (state block ~lines 46–52; `addChat`/`syncChat` ~lines 210–272; new render/open/close functions; element refs)
 
 **Interfaces:**
+
 - Consumes from Task 1: `groupThreads`, `resolveRootId`, `threadChipLabel`.
 - Produces: a client model `messagesById: Map<string, ChatMsg>` + `messageOrder: string[]`; `renderChat()`, `renderThread(rootId)`, `openThread(rootId)`, `closeThread()`; state `openThreadRootId: string`. Used by Tasks 5–6.
 
@@ -588,7 +660,9 @@ function buildBubble(message, { chip = null, isRoot = false } = {}) {
   let html = "<small>" + (message.role === "agent" ? "Agent" : "You") + "</small><div>" + body + "</div>";
   if (chip) {
     html +=
-      '<button class="thread-chip" type="button" data-root-id="' + escapeHtml(String(message.id)) + '">' +
+      '<button class="thread-chip" type="button" data-root-id="' +
+      escapeHtml(String(message.id)) +
+      '">' +
       escapeHtml(chip) +
       "</button>";
   }
@@ -779,10 +853,12 @@ git commit -m "feat(ui): render roots + thread chips, slide-out thread view, ope
 ### Task 5: Reply flow — main composer starts roots, thread composer sends replies
 
 **Files:**
+
 - Modify: `src/chrome-client.js` (`sendQueued` ~line 340; add `sendThreadReply`; remove dead `replyToId`/`replyIndicator*` references; event wiring ~lines 639–688)
 - Modify: `test/chrome-client-threading.test.js` (add a reply-posting integration test through the harness)
 
 **Interfaces:**
+
 - Consumes: `openThreadRootId`, `threadReplyToId`, `requestSnapshot`, `submitQueued` (existing snapshot→submit pipeline).
 - Produces: thread replies posted to `/api/:key/prompts` with a `reply_to` field.
 
@@ -851,17 +927,17 @@ Expected: FAIL — there is no `threadSend` handler yet, so no `reply_to` post.
 In `sendQueued` (line 340), remove the `reply_to` attachment and the optimistic `reply_to`. Replace lines 346–360 (the `const text = …` block through `render();`) with:
 
 ```js
-  const text = chatInput.value.trim();
-  if (text) {
-    const message = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
-    queued.push(message);
-    persistQueuedPrompts();
-    rememberMessage({ role: "user", text });
-    renderChat();
-    if (workingBubble) chatLog.appendChild(workingBubble);
-    chatInput.value = "";
-    render();
-  }
+const text = chatInput.value.trim();
+if (text) {
+  const message = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
+  queued.push(message);
+  persistQueuedPrompts();
+  rememberMessage({ role: "user", text });
+  renderChat();
+  if (workingBubble) chatLog.appendChild(workingBubble);
+  chatInput.value = "";
+  render();
+}
 ```
 
 - [ ] **Step 5: Add `sendThreadReply` and its submit path**
@@ -934,10 +1010,12 @@ git commit -m "feat(ui): main composer starts roots; thread composer sends repli
 ### Task 6: Live-update routing — append into the open thread or flag the Back badge
 
 **Files:**
+
 - Modify: `src/chrome-client.js` (`ingestIncoming` from Task 4)
 - Modify: `test/chrome-client-threading.test.js` (badge behavior tests)
 
 **Interfaces:**
+
 - Consumes: `shouldFlagBackBadge`, `openThreadRootId`, `messagesById`.
 - Produces: Back badge visibility driven by cross-thread activity; live thread append.
 
@@ -1064,6 +1142,7 @@ Expected: PASS.
 Verify the running product as an end user would, per the engineering bar. Playwright is used out-of-repo (do NOT add it to `package.json`).
 
 **Files:**
+
 - Create: `scratchpad/verify-thread-panel.mjs` (Playwright script; lives in the session scratchpad, not the repo)
 - Create: a tiny test artifact HTML to review (e.g. `scratchpad/verify-artifact.html`)
 
@@ -1124,6 +1203,7 @@ Report `git log --oneline d6fed75..HEAD` and the PR URL: `https://github.com/elo
 ## Self-Review
 
 **Spec coverage:**
+
 - Placement (drill-in slide-out) → Tasks 2 (scaffold), 3 (CSS), 4 (open/close). ✅
 - One-level threading derived client-side, server untouched → Task 1 (helpers), Task 4 (render); no server handler touched (only the `createChromeHtml` template). ✅
 - Roots in list, replies in thread, chips on roots with ≥1 reply → Task 4. ✅

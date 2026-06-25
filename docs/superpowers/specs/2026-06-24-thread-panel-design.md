@@ -41,7 +41,7 @@ The server is not changed.
 - **Root**: a message with no `reply_to`. Roots render in the main list.
 - **Reply**: a message with a `reply_to`. Replies never render in the main list; they render only inside their thread.
 - **Root resolution**: `resolveRoot(id)` walks `reply_to` upward until it reaches a message with no `reply_to`. The walk is cycle-safe (a `Set` of visited ids; if a cycle or a dangling `reply_to` is hit, the message is treated as its own root so nothing is ever dropped).
-- **One level of display**: a reply to a reply still resolves to the same root and displays flat under that root, ordered by time. We keep the precise `reply_to` pointer on the wire (so the agent still receives exactly which message a reply answered), but the *display* is one level deep.
+- **One level of display**: a reply to a reply still resolves to the same root and displays flat under that root, ordered by time. We keep the precise `reply_to` pointer on the wire (so the agent still receives exactly which message a reply answered), but the _display_ is one level deep.
 
 Client state, replacing the current `chatMessages: Map<id, text>`:
 
@@ -111,7 +111,7 @@ Before anything is pushed to the fork:
 ## Out of scope (YAGNI)
 
 - Arbitrary nested threads (we stay one level deep, like Slack).
-- Per-thread unread *counts* (a single boolean Back badge is enough for a single reviewer).
+- Per-thread unread _counts_ (a single boolean Back badge is enough for a single reviewer).
 - Server-side thread aggregation or a thread index endpoint (client derivation suffices at this transcript size).
 - Collapsing/pinning threads, thread search, reactions.
 
