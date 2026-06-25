@@ -125,3 +125,27 @@ test("thread composer posts a reply carrying reply_to", async () => {
   assert.ok(replyPost, "a prompts POST was made");
   assert.equal(replyPost.body.prompts[0].reply_to, "root1");
 });
+
+test("incoming reply to the open thread does not flag the Back badge", async () => {
+  const chrome = await createChromeHarness();
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root", at: 1 }] }),
+  });
+  chrome.threadingOpen("root1");
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ id: "r2", role: "agent", text: "in-thread reply", reply_to: "root1", at: 2 }),
+  });
+  assert.equal(chrome.element("backBadge").hidden, true);
+});
+
+test("incoming activity outside the open thread flags the Back badge", async () => {
+  const chrome = await createChromeHarness();
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root", at: 1 }] }),
+  });
+  chrome.threadingOpen("root1");
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ id: "root2", role: "agent", text: "a new root", at: 2 }),
+  });
+  assert.equal(chrome.element("backBadge").hidden, false);
+});

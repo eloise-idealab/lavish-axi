@@ -864,10 +864,25 @@ initializeLayoutGate();
 
 function ingestIncoming(message) {
   if (!message || !message.text) return;
+  // Build a lookahead map that includes the incoming message so resolveRootId can follow its
+  // reply_to chain even though rememberMessage hasn't run yet.
+  const lookahead = message.id != null ? new Map([...messagesById, [String(message.id), message]]) : messagesById;
+  const flagBadge = shouldFlagBackBadge(openThreadRootId, message, lookahead) || flagsNewRoot(message);
   rememberMessage(message);
   renderChat();
   if (workingBubble) chatLog.appendChild(workingBubble);
-  if (openThreadRootId) renderThread(openThreadRootId);
+  if (openThreadRootId) {
+    renderThread(openThreadRootId);
+    if (flagBadge) setBackBadge(true);
+  }
+}
+
+// A brand-new root (no reply_to, not yet in the model) is "outside" any open thread, so it should
+// also flag the badge. shouldFlagBackBadge already covers replies to other roots.
+function flagsNewRoot(message) {
+  if (!openThreadRootId) return false;
+  const id = message.id != null ? String(message.id) : "";
+  return !message.reply_to && id !== openThreadRootId;
 }
 
 const events = new EventSource("/events/" + key);
