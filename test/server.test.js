@@ -103,6 +103,17 @@ test("chrome sandbox does not grant modal prompts", () => {
   assert.doesNotMatch(html, /sandbox="[^"]*allow-modals/);
 });
 
+test("createChromeHtml includes the thread-pane scaffold", () => {
+  const html = createChromeHtml({ key: "k", file: "/tmp/a.html", chat: [] });
+  assert.match(html, /id="chatPane"/);
+  assert.match(html, /id="threadPane"/);
+  assert.match(html, /id="threadBack"/);
+  assert.match(html, /id="backBadge"/);
+  assert.match(html, /id="threadChat"/);
+  assert.match(html, /id="threadInput"/);
+  assert.match(html, /id="threadSend"/);
+});
+
 test("artifact SDK uses a custom annotation card instead of browser prompts", () => {
   const js = createSdkJs("abc");
 
@@ -2041,7 +2052,7 @@ test("chrome client renders reply affordance and threading (change #3)", async (
   assert.match(js, /function setReplyTarget\(/);
   assert.match(js, /class="reply-button"/);
   assert.match(js, /message\.reply_to = replyToId/);
-  assert.match(html, /id="replyIndicator"/);
+  assert.match(html, /id="threadReplyIndicator"/);
   assert.match(css, /\.reply-button\{/);
   assert.match(css, /\.reply-indicator\{/);
 });
