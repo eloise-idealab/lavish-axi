@@ -127,6 +127,11 @@ export async function serve({
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
       const immediate = await store.takeFeedback(key);
       if (immediate.status !== "waiting") {
+        // If the client already vanished, put a taken feedback batch back rather than dropping it.
+        if (immediate.status === "feedback" && req.destroyed) {
+          await store.requeueFeedback(key, immediate);
+          return;
+        }
         if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
         res.json(immediate);
         return;
@@ -146,9 +151,11 @@ export async function serve({
       const timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
       let cleaned = false;
       let responding = false;
+      let closed = false;
       const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
+        closed = true;
         if (timer) clearTimeout(timer);
         if (heartbeat) clearInterval(heartbeat);
         events.off("feedback", onFeedback);
@@ -161,6 +168,12 @@ export async function serve({
         responding = true;
         try {
           const result = await store.takeFeedback(key);
+          // Client vanished as we took the batch — requeue it so the next poll/stream still gets it
+          // (same deliver-then-restore guarantee the stream path has).
+          if (result.status === "feedback" && (closed || req.destroyed)) {
+            await store.requeueFeedback(key, result);
+            return;
+          }
           if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
           if (streamHeartbeat) {
             res.end(JSON.stringify(result));
@@ -269,7 +282,9 @@ export async function serve({
                 id: first.id || "",
                 ...(first.reply_to ? { reply_to: first.reply_to } : {}),
               });
-              if (rest.length > 0) await store.requeueFeedback(key, { prompts: rest });
+              // Requeue the tail WITH the batch's dom_snapshot so the next consumer keeps the DOM
+              // context that produced those messages.
+              if (rest.length > 0) await store.requeueFeedback(key, { prompts: rest, dom_snapshot: dom });
               oneDelivered = true;
               if (!res.writableEnded) res.end();
               return;
