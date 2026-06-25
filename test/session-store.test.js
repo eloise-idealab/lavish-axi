@@ -460,3 +460,55 @@ test("addAgentReply drops an unknown reply_to but keeps a valid one (MEDIUM regr
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("peekFeedback does not consume the batch, so an undelivered stream batch survives (C1 regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-peek-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.queuePrompts(session.key, { prompts: [{ tag: "message", prompt: "keep me" }] });
+
+    // Peeking returns the batch WITHOUT clearing it. This models the stream: if the socket dies
+    // before delivery, the message must still be queued (deliver-then-ack, never take-then-drop).
+    const first = feedbackResult(await store.peekFeedback(session.key));
+    assert.equal(first.prompts.find((p) => p.tag === "message").prompt, "keep me");
+    const second = feedbackResult(await store.peekFeedback(session.key));
+    assert.equal(second.prompts.find((p) => p.tag === "message").prompt, "keep me");
+
+    // Only after a successful delivery do we ack, which clears the delivered prefix.
+    await store.ackFeedback(session.key, { prompts: first.prompts.length, layoutWarnings: 0 });
+    assert.equal((await store.peekFeedback(session.key)).status, "waiting");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ackFeedback clears only the delivered prefix, preserving messages queued during delivery (C1 regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-ack-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.queuePrompts(session.key, { prompts: [{ tag: "message", prompt: "A" }] });
+
+    const batch = feedbackResult(await store.peekFeedback(session.key)); // [A]
+    // A new message arrives mid-delivery; acking the delivered prefix must not drop it.
+    await store.queuePrompts(session.key, { prompts: [{ tag: "message", prompt: "B" }] }); // [A, B]
+    await store.ackFeedback(session.key, { prompts: batch.prompts.length, layoutWarnings: 0 }); // -> [B]
+
+    const next = feedbackResult(await store.peekFeedback(session.key));
+    assert.deepEqual(
+      next.prompts.filter((p) => p.tag === "message").map((p) => p.prompt),
+      ["B"],
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

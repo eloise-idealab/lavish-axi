@@ -174,6 +174,62 @@ export class SessionStore {
     });
   }
 
+  // Non-destructive twin of takeFeedback: returns the current batch but leaves it queued. The
+  // stream uses peek -> deliver -> ack (see server.js) so a client that drops mid-drain never loses
+  // messages the store already cleared (C1). takeFeedback stays as the atomic one-shot take used by
+  // the poll path. Shape matches takeFeedback so the stream can build frames identically.
+  async peekFeedback(key) {
+    return this.withLock(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) {
+        return { status: "missing" };
+      }
+      const prompts = session.prompts || [];
+      const layoutWarnings = session.layout_warnings || [];
+      if (prompts.length === 0 && layoutWarnings.length === 0) {
+        return session.status === "ended" ? { status: "ended" } : { status: "waiting" };
+      }
+      return {
+        status: "feedback",
+        dom_snapshot: session.dom_snapshot || "",
+        prompts: [...prompts],
+        ...(layoutWarnings.length > 0 ? { layout_warnings: [...layoutWarnings] } : {}),
+      };
+    });
+  }
+
+  // Clear exactly the prefix a peekFeedback delivered: drop the first `prompts` queued items
+  // (anything queued during delivery sits at the tail and survives) and the delivered layout
+  // warnings. Called only after the batch was written to a live socket, so an interrupted delivery
+  // leaves the batch queued for the next stream/poll.
+  async ackFeedback(key, { prompts = 0, layoutWarnings = 0 } = {}) {
+    return this.withLock(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) {
+        return null;
+      }
+      if (prompts > 0) {
+        session.prompts = (session.prompts || []).slice(prompts);
+      }
+      if (layoutWarnings > 0) {
+        session.layout_warnings = (session.layout_warnings || []).slice(layoutWarnings);
+      }
+      const remainingPrompts = (session.prompts || []).length;
+      session.pending_prompts = remainingPrompts;
+      if (remainingPrompts === 0) {
+        session.dom_snapshot = "";
+      }
+      if (session.status !== "ended" && remainingPrompts === 0 && (session.layout_warnings || []).length === 0) {
+        session.status = "open";
+      }
+      session.updated_at = new Date().toISOString();
+      await this.writeState(state);
+      return session;
+    });
+  }
+
   async endSession(key) {
     return this.withLock(async () => {
       const state = await this.readState();

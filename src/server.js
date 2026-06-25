@@ -215,6 +215,8 @@ export async function serve({
         return;
       }
       streamClients.add(res);
+      // Tracks client disconnect so the drain never acks (clears) a batch it couldn't deliver.
+      let closed = false;
       res.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
@@ -239,12 +241,13 @@ export async function serve({
         }
         draining = true;
         try {
-          let result = await store.takeFeedback(key);
-          while (result.status === "feedback") {
+          let batch = await store.peekFeedback(key);
+          while (batch.status === "feedback") {
+            // Deliver-then-ack (C1): never clear a batch we can't deliver. If the client vanished,
+            // leave it queued (don't ack) so the next stream/poll still gets it.
+            if (closed || req.destroyed) return;
             markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
-            const feedback = /** @type {{ prompts?: any[], layout_warnings?: any[], dom_snapshot?: string }} */ (
-              result
-            );
+            const feedback = /** @type {{ prompts?: any[], layout_warnings?: any[], dom_snapshot?: string }} */ (batch);
             const prompts = Array.isArray(feedback.prompts) ? feedback.prompts : [];
             const layoutWarnings = Array.isArray(feedback.layout_warnings) ? feedback.layout_warnings : [];
             // One SSE frame per user message keeps the "one subagent per message" contract; layout
@@ -268,9 +271,12 @@ export async function serve({
                 });
               });
             }
-            result = await store.takeFeedback(key);
+            // Frames are on the wire; clear exactly what we delivered. Anything queued during the
+            // write sits at the tail and survives for the next peek.
+            await store.ackFeedback(key, { prompts: prompts.length, layoutWarnings: layoutWarnings.length });
+            batch = await store.peekFeedback(key);
           }
-          if (result.status === "ended") writeFrame("ended", { file });
+          if (batch.status === "ended") writeFrame("ended", { file });
         } finally {
           draining = false;
           if (drainAgain) {
@@ -294,6 +300,7 @@ export async function serve({
       heartbeat.unref?.();
 
       req.on("close", () => {
+        closed = true;
         streamClients.delete(res);
         clearInterval(heartbeat);
         events.off("feedback", onFeedback);
