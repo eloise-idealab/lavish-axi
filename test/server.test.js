@@ -2086,3 +2086,50 @@ test("GET /api/stream?once=1 delivers exactly one user message and requeues the 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("two concurrent streams on one session deliver each message exactly once (atomic take)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-dup-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    maxStreamClients: 4,
+  });
+  const controllers = [];
+  const openStream = () => {
+    const controller = new AbortController();
+    controllers.push(controller);
+    return fetch(`http://127.0.0.1:${server.port}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+  };
+  const countMessages = (frames) =>
+    frames.filter((f) => f.event === "message" && (f.data.prompts || []).some((p) => p.tag === "message")).length;
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+    const [a, b] = await Promise.all([openStream(), openStream()]);
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ tag: "message", prompt: "only once" }] }),
+    });
+
+    // Atomic takeFeedback means exactly one of the two streams delivers the message — never both.
+    const [framesA, framesB] = await Promise.all([
+      collectSseFrames(a.body, (all) => countMessages(all) >= 1, 1000),
+      collectSseFrames(b.body, (all) => countMessages(all) >= 1, 1000),
+    ]);
+    assert.equal(countMessages(framesA) + countMessages(framesB), 1, "delivered exactly once across both streams");
+  } finally {
+    for (const controller of controllers) controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

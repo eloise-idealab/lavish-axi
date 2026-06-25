@@ -120,20 +120,40 @@ export async function serve({
   });
 
   app.get("/api/poll", async (req, res, next) => {
+    let cleanup = null;
+    let closed = false;
+    let key;
+    // Track disconnect BEFORE the first await: a close during the initial takeFeedback would
+    // otherwise be missed (cleanup registered too late) and leak presence/idle state on the
+    // waiting path. cleanup is null until the long-poll is set up; the post-await guard handles
+    // a close that lands before then.
+    req.on("close", () => {
+      closed = true;
+      if (cleanup) cleanup();
+    });
+    // Restore a taken batch to the queue and wake any other open consumer, since this client is gone.
+    const requeueAndWake = async (batch) => {
+      await store.requeueFeedback(key, batch);
+      events.emit("feedback", key);
+    };
     try {
       const file = await canonicalFile(String(req.query.file || ""));
-      const key = sessionKey(file);
+      key = sessionKey(file);
       const timeoutMs =
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
       const immediate = await store.takeFeedback(key);
+      if (closed || req.destroyed) {
+        if (immediate.status === "feedback") await requeueAndWake(immediate);
+        return;
+      }
       if (immediate.status !== "waiting") {
-        // If the client already vanished, put a taken feedback batch back rather than dropping it.
-        if (immediate.status === "feedback" && req.destroyed) {
-          await store.requeueFeedback(key, immediate);
-          return;
-        }
         if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
-        res.json(immediate);
+        try {
+          res.json(immediate);
+        } catch (error) {
+          if (immediate.status === "feedback") await requeueAndWake(immediate);
+          throw error;
+        }
         return;
       }
       const streamHeartbeat = timeoutMs === null;
@@ -151,11 +171,9 @@ export async function serve({
       const timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
       let cleaned = false;
       let responding = false;
-      let closed = false;
-      const cleanup = () => {
+      cleanup = () => {
         if (cleaned) return;
         cleaned = true;
-        closed = true;
         if (timer) clearTimeout(timer);
         if (heartbeat) clearInterval(heartbeat);
         events.off("feedback", onFeedback);
@@ -171,7 +189,7 @@ export async function serve({
           // Client vanished as we took the batch — requeue it so the next poll/stream still gets it
           // (same deliver-then-restore guarantee the stream path has).
           if (result.status === "feedback" && (closed || req.destroyed)) {
-            await store.requeueFeedback(key, result);
+            await requeueAndWake(result);
             return;
           }
           if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
@@ -200,8 +218,11 @@ export async function serve({
       };
       events.on("feedback", onFeedback);
       events.on("ended", onFeedback);
-      req.on("close", cleanup);
+      // A close that landed after the post-await guard but before cleanup was assigned would have
+      // found cleanup still null; run it now so nothing leaks.
+      if (closed) cleanup();
     } catch (error) {
+      if (cleanup) cleanup();
       next(error);
     }
   });
@@ -236,7 +257,9 @@ export async function serve({
       let closed = false;
       let heartbeat = null;
       let cleanedUp = false;
-      let oneDelivered = false;
+      // Set once this stream is finished delivering (a --once single message, or a detected
+      // disconnect): blocks any further drain so a requeue's re-emitted "feedback" can't loop here.
+      let stopped = false;
       let draining = false;
       let drainAgain = false;
       // Each emitted frame is `event: <name>\ndata: <json>\n\n`.
@@ -246,8 +269,8 @@ export async function serve({
       const drain = async () => {
         // Serialize drains so two near-simultaneous "feedback" events can't double-take the queue;
         // re-run once if another event lands mid-drain. A --once stream stops after one user message.
-        if (draining || oneDelivered) {
-          if (!oneDelivered) drainAgain = true;
+        if (draining || stopped) {
+          if (!stopped) drainAgain = true;
           return;
         }
         draining = true;
@@ -259,7 +282,11 @@ export async function serve({
             // never write to a dead socket and drop. Atomic take (not peek) keeps this correct under
             // multiple consumers: only one stream can take a given batch, so no double-delivery.
             if (closed || req.destroyed) {
+              // Detected disconnect: restore the batch and wake any other open consumer. `stopped`
+              // keeps this dead stream's own re-drain from looping on the re-emitted event.
+              stopped = true;
               await store.requeueFeedback(key, batch);
+              events.emit("feedback", key);
               return;
             }
             markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
@@ -284,8 +311,11 @@ export async function serve({
               });
               // Requeue the tail WITH the batch's dom_snapshot so the next consumer keeps the DOM
               // context that produced those messages.
-              if (rest.length > 0) await store.requeueFeedback(key, { prompts: rest, dom_snapshot: dom });
-              oneDelivered = true;
+              if (rest.length > 0) {
+                await store.requeueFeedback(key, { prompts: rest, dom_snapshot: dom });
+                events.emit("feedback", key);
+              }
+              stopped = true;
               if (!res.writableEnded) res.end();
               return;
             }
@@ -311,7 +341,7 @@ export async function serve({
           if (batch.status === "ended") writeFrame("ended", { file });
         } finally {
           draining = false;
-          if (drainAgain && !oneDelivered) {
+          if (drainAgain && !stopped) {
             drainAgain = false;
             drain().catch(() => {});
           }
