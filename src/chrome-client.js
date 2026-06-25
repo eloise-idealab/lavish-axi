@@ -87,6 +87,19 @@ function escapeHtml(value) {
   );
 }
 
+// Render a safe subset of inline markdown for agent messages: **bold**, *italic* / _italic_, and
+// `code`. HTML is escaped FIRST, then the markdown tokens are applied to the escaped string, so the
+// only tags introduced are the ones added here — no injection from message text.
+function renderInlineMarkdown(text) {
+  let html = escapeHtml(text);
+  html = html.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  html = html.replace(/\*\*([^*\n]+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/(^|[\s(])\*([^*\s][^*\n]*?)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+  html = html.replace(/(^|[\s(])_([^_\s][^_\n]*?)_(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+  html = html.replace(/\n/g, "<br>");
+  return html;
+}
+
 function loadQueuedPrompts() {
   try {
     const parsed = JSON.parse(sessionStorage.getItem(queueStorageKey) || "[]");
@@ -201,7 +214,8 @@ function addChat(role, text, meta = {}) {
   el.className = "bubble " + role;
   if (meta.id) {
     el.dataset.messageId = String(meta.id);
-    if (role === "agent") chatMessages.set(String(meta.id), text);
+    // Store every message (user and agent) so any of them can be quoted and replied to.
+    chatMessages.set(String(meta.id), text);
   }
   // Change #3 (threading): show which earlier message this one replies to, as a quoted snippet.
   let threadHtml = "";
@@ -211,20 +225,14 @@ function addChat(role, text, meta = {}) {
       threadHtml = '<div class="reply-quote">' + escapeHtml(truncateQuote(quoted)) + "</div>";
     }
   }
-  // Agent bubbles get a Reply affordance so the user can thread a response to that specific message.
-  const replyHtml =
-    role === "agent" && meta.id
-      ? '<button class="reply-button" type="button" data-reply-id="' + escapeHtml(String(meta.id)) + '">Reply</button>'
-      : "";
+  // Every message with an id gets a Reply affordance so you can thread under your own messages too.
+  const replyHtml = meta.id
+    ? '<button class="reply-button" type="button" data-reply-id="' + escapeHtml(String(meta.id)) + '">Reply</button>'
+    : "";
+  // Agent messages render a safe subset of markdown (**bold**, *italic*, `code`); user text stays plain.
+  const body = role === "agent" ? renderInlineMarkdown(text) : escapeHtml(text);
   el.innerHTML =
-    "<small>" +
-    (role === "agent" ? "Agent" : "You") +
-    "</small>" +
-    threadHtml +
-    "<div>" +
-    escapeHtml(text) +
-    "</div>" +
-    replyHtml;
+    "<small>" + (role === "agent" ? "Agent" : "You") + "</small>" + threadHtml + "<div>" + body + "</div>" + replyHtml;
   const replyButton = el.querySelector(".reply-button");
   if (replyButton) {
     replyButton.addEventListener("click", () => setReplyTarget(String(meta.id), text));

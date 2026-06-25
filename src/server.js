@@ -416,6 +416,7 @@ export async function serve({
         return;
       }
       events.emit("feedback", req.params.key);
+      events.emit("chat-changed", req.params.key);
       res.json({ status: "queued", pending_prompts: session.pending_prompts });
     } catch (error) {
       next(error);
@@ -562,6 +563,13 @@ export async function serve({
           res.write(`event: agent-presence\ndata: ${JSON.stringify({ state })}\n\n`);
         }
       };
+      // Re-broadcast the transcript when it changes (e.g. a user message was queued) so the browser
+      // can tag its just-sent bubbles with the server-assigned ids, making them reply-able.
+      const sendChatSync = async (key) => {
+        if (key !== req.params.key || res.writableEnded) return;
+        const fresh = await store.findByKey(key);
+        res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: fresh?.chat || [] })}\n\n`);
+      };
       res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: session?.chat || [] })}\n\n`);
       res.write(
         `event: agent-presence\ndata: ${JSON.stringify({ state: computePresence(req.params.key, activePolls, deliveredFeedback) })}\n\n`,
@@ -569,11 +577,13 @@ export async function serve({
       events.on("reload", sendReload);
       events.on("agent-reply", sendAgentReply);
       events.on("agent-presence", sendPresence);
+      events.on("chat-changed", sendChatSync);
       req.on("close", () => {
         sseClients.delete(res);
         events.off("reload", sendReload);
         events.off("agent-reply", sendAgentReply);
         events.off("agent-presence", sendPresence);
+        events.off("chat-changed", sendChatSync);
         refreshIdleTimer();
       });
     } catch (error) {
