@@ -310,19 +310,9 @@ async function streamCommand(args) {
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      let boundary;
-      while (!stop && (boundary = buffer.indexOf("\n\n")) !== -1) {
-        const raw = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        let event = "message";
-        const dataLines = [];
-        for (const line of raw.split("\n")) {
-          if (line.startsWith(":")) continue;
-          if (line.startsWith("event:")) event = line.slice(6).trim();
-          else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
-        }
-        if (dataLines.length > 0) handleFrame(event, dataLines.join("\n"));
-      }
+      // Drain every complete frame already received before honoring --once's stop, so a multi-
+      // message batch that arrived in one read is fully emitted instead of truncated (I1).
+      buffer = drainSseBuffer(buffer, handleFrame);
     }
   } finally {
     process.off("SIGINT", onSignal);
@@ -367,6 +357,26 @@ export function streamMessageRecord(payload) {
     dom_snapshot: payload.dom_snapshot || "",
   };
   return { record, isUserMessage: Boolean(message) };
+}
+
+// Split an SSE byte buffer into complete `event:/data:` frames, hand each to `onFrame`, and return
+// any trailing partial frame for the next read. Drains the whole buffer regardless of caller stop
+// state so a --once consumer can't truncate a multi-frame batch mid-buffer (I1).
+export function drainSseBuffer(buffer, onFrame) {
+  let boundary;
+  while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+    const raw = buffer.slice(0, boundary);
+    buffer = buffer.slice(boundary + 2);
+    let event = "message";
+    const dataLines = [];
+    for (const line of raw.split("\n")) {
+      if (line.startsWith(":")) continue;
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+    }
+    if (dataLines.length > 0) onFrame(event, dataLines.join("\n"));
+  }
+  return buffer;
 }
 
 export function streamBannerText(file) {

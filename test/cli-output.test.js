@@ -17,6 +17,7 @@ import {
   createPollOutput,
   createPlaybookOutput,
   createServerSpawnOptions,
+  drainSseBuffer,
   fetchJson,
   getCommandHelp,
   normalizeArgv,
@@ -896,4 +897,26 @@ test("streamMessageRecord does NOT treat an annotation-only frame as a user mess
     prompts: [{ tag: "h1", prompt: "tighten this", selector: "h1", text: "Title" }],
   });
   assert.equal(isUserMessage, false);
+});
+
+test("drainSseBuffer emits every complete buffered frame, even after the handler signals stop (I1 regression)", () => {
+  // Under --once the handler sets stop on the first user message. A multi-message batch that
+  // arrived in one read must still be fully emitted, not truncated at the first frame.
+  const handled = [];
+  const onFrame = (event, data) => handled.push({ event, data });
+  const buffer = `event: message\ndata: {"n":1}\n\nevent: message\ndata: {"n":2}\n\n`;
+  const rest = drainSseBuffer(buffer, onFrame);
+  assert.equal(handled.length, 2, "both buffered frames are emitted, not just the first");
+  assert.equal(handled[0].data, '{"n":1}');
+  assert.equal(handled[1].data, '{"n":2}');
+  assert.equal(rest, "", "no complete frame is left unprocessed");
+});
+
+test("drainSseBuffer returns a trailing partial frame for the next read (I1 regression)", () => {
+  const handled = [];
+  const rest = drainSseBuffer(`event: message\ndata: {"n":1}\n\nevent: mess`, (event, data) =>
+    handled.push({ event, data }),
+  );
+  assert.equal(handled.length, 1);
+  assert.equal(rest, "event: mess", "the incomplete frame is preserved");
 });
