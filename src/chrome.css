@@ -563,6 +563,9 @@ body.lavish {
   border-radius: var(--radius-md, 6px);
   color: var(--fg-muted);
   font-size: 11px;
+  /* Grid child of .composer: allow it to shrink so a long quoted reply truncates instead of
+     forcing the whole composer to overflow horizontally. */
+  min-width: 0;
 }
 .reply-indicator-label {
   font-weight: var(--w-bold);
@@ -571,6 +574,10 @@ body.lavish {
 }
 .reply-indicator-text {
   flex: 1 1 auto;
+  /* Without min-width:0 a flex child won't shrink below its content width, so a nowrap quote
+     overflows to the right and the ellipsis never engages. This is the reported "wraps infinitely
+     to the right" bug. */
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
