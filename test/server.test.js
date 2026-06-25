@@ -2045,3 +2045,44 @@ test("chrome client renders reply affordance and threading (change #3)", async (
   assert.match(css, /\.reply-button\{/);
   assert.match(css, /\.reply-indicator\{/);
 });
+
+test("GET /api/stream?once=1 delivers exactly one user message and requeues the rest of the batch (HIGH regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-once-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+
+    // Queue two messages BEFORE the once stream opens so they form a single batch.
+    for (const text of ["first", "second"]) {
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompts: [{ tag: "message", prompt: text }] }),
+      });
+    }
+
+    const streamRes = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}&once=1`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    assert.equal(streamRes.status, 200);
+    const frames = await collectSseFrames(streamRes.body, (all) => all.some((f) => f.event === "message"));
+    const messages = frames.filter((f) => f.event === "message");
+    assert.equal(messages.length, 1, "once stream delivers exactly one user message");
+    assert.equal(messages[0].data.prompts.find((p) => p.tag === "message").prompt, "first");
+
+    // The second message must NOT be lost: a later poll still delivers it.
+    const poll = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=2000`);
+    const body = await poll.json();
+    assert.equal(body.status, "feedback");
+    assert.equal(body.prompts.find((p) => p.tag === "message").prompt, "second");
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

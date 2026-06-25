@@ -199,9 +199,13 @@ export async function serve({
   // and fans out a subagent per frame. An open stream counts as a live poll for presence, so the
   // browser sees "listening" and the Send button stays active (folds in change #2 naturally).
   app.get("/api/stream", async (req, res, next) => {
+    // Held outside the try so a synchronous throw after we register the stream still runs cleanup
+    // (otherwise the slot/listeners/presence would leak for the process lifetime).
+    let cleanup = null;
     try {
       const file = await canonicalFile(String(req.query.file || ""));
       const key = sessionKey(file);
+      const once = isTruthyFlag(req.query.once);
       const session = await store.findByKey(key);
       if (!session) {
         res.status(404).json({ status: "missing" });
@@ -215,100 +219,125 @@ export async function serve({
         return;
       }
       streamClients.add(res);
-      // Tracks client disconnect so the drain never acks (clears) a batch it couldn't deliver.
+      // Tracks client disconnect so the drain never clears a batch it couldn't deliver.
       let closed = false;
-      res.writeHead(200, {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-        connection: "keep-alive",
-      });
+      let heartbeat = null;
+      let cleanedUp = false;
+      let oneDelivered = false;
+      let draining = false;
+      let drainAgain = false;
       // Each emitted frame is `event: <name>\ndata: <json>\n\n`.
       const writeFrame = (event, data) => {
         if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
       };
-      setPollActive(key, activePolls, deliveredFeedback, events, true);
-      refreshIdleTimer();
-      writeFrame("ready", { file });
-
-      let draining = false;
-      let drainAgain = false;
       const drain = async () => {
         // Serialize drains so two near-simultaneous "feedback" events can't double-take the queue;
-        // re-run once if another event lands mid-drain.
-        if (draining) {
-          drainAgain = true;
+        // re-run once if another event lands mid-drain. A --once stream stops after one user message.
+        if (draining || oneDelivered) {
+          if (!oneDelivered) drainAgain = true;
           return;
         }
         draining = true;
         try {
-          let batch = await store.peekFeedback(key);
+          let batch = await store.takeFeedback(key);
           while (batch.status === "feedback") {
-            // Deliver-then-ack (C1): never clear a batch we can't deliver. If the client vanished,
-            // leave it queued (don't ack) so the next stream/poll still gets it.
-            if (closed || req.destroyed) return;
+            // Deliver-then-restore (C1): takeFeedback already cleared this batch atomically. If a
+            // *detected* disconnect happened, put it back so the next stream/poll still gets it —
+            // never write to a dead socket and drop. Atomic take (not peek) keeps this correct under
+            // multiple consumers: only one stream can take a given batch, so no double-delivery.
+            if (closed || req.destroyed) {
+              await store.requeueFeedback(key, batch);
+              return;
+            }
             markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
             const feedback = /** @type {{ prompts?: any[], layout_warnings?: any[], dom_snapshot?: string }} */ (batch);
             const prompts = Array.isArray(feedback.prompts) ? feedback.prompts : [];
             const layoutWarnings = Array.isArray(feedback.layout_warnings) ? feedback.layout_warnings : [];
+            const dom = feedback.dom_snapshot || "";
             // One SSE frame per user message keeps the "one subagent per message" contract; layout
             // warnings (and any non-message prompts) ride along on the batch's first frame.
             const messages = prompts.filter((p) => p && p.tag === "message" && p.prompt);
             const extras = prompts.filter((p) => !(p && p.tag === "message" && p.prompt));
+            if (once && messages.length > 0) {
+              // --once delivers exactly one user message and requeues the rest of the batch, so a
+              // single-shot harness never loses the tail of a multi-message batch.
+              const [first, ...rest] = messages;
+              writeFrame("message", {
+                prompts: [first, ...extras],
+                ...(layoutWarnings.length > 0 ? { layout_warnings: layoutWarnings } : {}),
+                dom_snapshot: dom,
+                id: first.id || "",
+                ...(first.reply_to ? { reply_to: first.reply_to } : {}),
+              });
+              if (rest.length > 0) await store.requeueFeedback(key, { prompts: rest });
+              oneDelivered = true;
+              if (!res.writableEnded) res.end();
+              return;
+            }
             if (messages.length === 0 && (extras.length > 0 || layoutWarnings.length > 0)) {
               writeFrame("message", {
                 prompts: extras,
                 ...(layoutWarnings.length > 0 ? { layout_warnings: layoutWarnings } : {}),
-                dom_snapshot: feedback.dom_snapshot || "",
+                dom_snapshot: dom,
               });
             } else {
               messages.forEach((message, index) => {
                 writeFrame("message", {
                   prompts: [message, ...(index === 0 ? extras : [])],
                   ...(index === 0 && layoutWarnings.length > 0 ? { layout_warnings: layoutWarnings } : {}),
-                  dom_snapshot: index === 0 ? feedback.dom_snapshot || "" : "",
+                  dom_snapshot: index === 0 ? dom : "",
                   id: message.id || "",
                   ...(message.reply_to ? { reply_to: message.reply_to } : {}),
                 });
               });
             }
-            // Frames are on the wire; clear exactly what we delivered. Anything queued during the
-            // write sits at the tail and survives for the next peek.
-            await store.ackFeedback(key, { prompts: prompts.length, layoutWarnings: layoutWarnings.length });
-            batch = await store.peekFeedback(key);
+            batch = await store.takeFeedback(key);
           }
           if (batch.status === "ended") writeFrame("ended", { file });
         } finally {
           draining = false;
-          if (drainAgain) {
+          if (drainAgain && !oneDelivered) {
             drainAgain = false;
             drain().catch(() => {});
           }
         }
       };
-
       const onFeedback = (changedKey) => {
         if (changedKey === key) drain().catch(() => {});
       };
+      cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        closed = true;
+        streamClients.delete(res);
+        if (heartbeat) clearInterval(heartbeat);
+        events.off("feedback", onFeedback);
+        events.off("ended", onFeedback);
+        setPollActive(key, activePolls, deliveredFeedback, events, false);
+        refreshIdleTimer();
+      };
+      // Register cleanup before anything that can throw, so an early failure can't leak the slot.
+      req.on("close", cleanup);
+
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      setPollActive(key, activePolls, deliveredFeedback, events, true);
+      refreshIdleTimer();
+      writeFrame("ready", { file });
       events.on("feedback", onFeedback);
       events.on("ended", onFeedback);
       // Drain anything already queued before the stream opened.
       drain().catch(() => {});
 
-      const heartbeat = setInterval(() => {
+      heartbeat = setInterval(() => {
         if (!res.writableEnded) res.write(": keep-alive\n\n");
       }, pollHeartbeatMs);
       heartbeat.unref?.();
-
-      req.on("close", () => {
-        closed = true;
-        streamClients.delete(res);
-        clearInterval(heartbeat);
-        events.off("feedback", onFeedback);
-        events.off("ended", onFeedback);
-        setPollActive(key, activePolls, deliveredFeedback, events, false);
-        refreshIdleTimer();
-      });
     } catch (error) {
+      if (cleanup) cleanup();
       next(error);
     }
   });

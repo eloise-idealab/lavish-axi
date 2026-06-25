@@ -461,34 +461,8 @@ test("addAgentReply drops an unknown reply_to but keeps a valid one (MEDIUM regr
   }
 });
 
-test("peekFeedback does not consume the batch, so an undelivered stream batch survives (C1 regression)", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-peek-"));
-  try {
-    const stateFile = path.join(dir, "state.json");
-    const artifact = path.join(dir, "artifact.html");
-    await writeFile(artifact, "<h1>Hello</h1>");
-
-    const store = new SessionStore(stateFile);
-    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
-    await store.queuePrompts(session.key, { prompts: [{ tag: "message", prompt: "keep me" }] });
-
-    // Peeking returns the batch WITHOUT clearing it. This models the stream: if the socket dies
-    // before delivery, the message must still be queued (deliver-then-ack, never take-then-drop).
-    const first = feedbackResult(await store.peekFeedback(session.key));
-    assert.equal(first.prompts.find((p) => p.tag === "message").prompt, "keep me");
-    const second = feedbackResult(await store.peekFeedback(session.key));
-    assert.equal(second.prompts.find((p) => p.tag === "message").prompt, "keep me");
-
-    // Only after a successful delivery do we ack, which clears the delivered prefix.
-    await store.ackFeedback(session.key, { prompts: first.prompts.length, layoutWarnings: 0 });
-    assert.equal((await store.peekFeedback(session.key)).status, "waiting");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("ackFeedback clears only the delivered prefix, preserving messages queued during delivery (C1 regression)", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-ack-"));
+test("requeueFeedback restores an undelivered batch at the front so a dropped stream loses nothing (C1 regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-requeue-"));
   try {
     const stateFile = path.join(dir, "state.json");
     const artifact = path.join(dir, "artifact.html");
@@ -498,16 +472,47 @@ test("ackFeedback clears only the delivered prefix, preserving messages queued d
     const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
     await store.queuePrompts(session.key, { prompts: [{ tag: "message", prompt: "A" }] });
 
-    const batch = feedbackResult(await store.peekFeedback(session.key)); // [A]
-    // A new message arrives mid-delivery; acking the delivered prefix must not drop it.
-    await store.queuePrompts(session.key, { prompts: [{ tag: "message", prompt: "B" }] }); // [A, B]
-    await store.ackFeedback(session.key, { prompts: batch.prompts.length, layoutWarnings: 0 }); // -> [B]
+    // The stream took the batch atomically (store now empty), then the client dropped before it was
+    // delivered. Meanwhile B was queued. Requeue must restore A ahead of B, losing nothing.
+    const taken = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(taken.prompts.find((p) => p.tag === "message").prompt, "A");
+    await store.queuePrompts(session.key, { prompts: [{ tag: "message", prompt: "B" }] });
+    await store.requeueFeedback(session.key, taken);
 
-    const next = feedbackResult(await store.peekFeedback(session.key));
+    const next = feedbackResult(await store.takeFeedback(session.key));
     assert.deepEqual(
       next.prompts.filter((p) => p.tag === "message").map((p) => p.prompt),
-      ["B"],
+      ["A", "B"],
     );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("requeueFeedback restores layout warnings only when none arrived since (C1 regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-requeue-lw-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const warn = (kind) => ({ selector: "html", kind, overflowPx: 1, viewportWidth: 720, severity: "error" });
+
+    // Nothing fresher arrived after the take -> the taken warning is restored.
+    await store.recordLayoutWarnings(session.key, { layout_warnings: [warn("overflow-a")] });
+    const taken = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(taken.layout_warnings.length, 1);
+    await store.requeueFeedback(session.key, taken);
+    assert.equal(feedbackResult(await store.takeFeedback(session.key)).layout_warnings[0].kind, "overflow-a");
+
+    // A fresh report arrived after the take -> requeue must NOT clobber it (replace-semantics).
+    await store.recordLayoutWarnings(session.key, { layout_warnings: [warn("overflow-old")] });
+    const stale = feedbackResult(await store.takeFeedback(session.key));
+    await store.recordLayoutWarnings(session.key, { layout_warnings: [warn("overflow-fresh")] });
+    await store.requeueFeedback(session.key, stale);
+    assert.equal(feedbackResult(await store.takeFeedback(session.key)).layout_warnings[0].kind, "overflow-fresh");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

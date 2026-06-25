@@ -252,7 +252,9 @@ async function streamCommand(args) {
   }
   const once = args.includes("--once");
   const write = (line) => process.stdout.write(`${line}\n`);
-  const url = `${baseUrl}/api/stream?file=${encodeURIComponent(absolute)}`;
+  // Tell the server it's a single-shot consumer so it delivers exactly one user message and
+  // requeues the rest of any batch, rather than writing the whole batch to a client that stops early.
+  const url = `${baseUrl}/api/stream?file=${encodeURIComponent(absolute)}${once ? "&once=1" : ""}`;
 
   let response;
   try {

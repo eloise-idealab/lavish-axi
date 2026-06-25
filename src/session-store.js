@@ -174,55 +174,37 @@ export class SessionStore {
     });
   }
 
-  // Non-destructive twin of takeFeedback: returns the current batch but leaves it queued. The
-  // stream uses peek -> deliver -> ack (see server.js) so a client that drops mid-drain never loses
-  // messages the store already cleared (C1). takeFeedback stays as the atomic one-shot take used by
-  // the poll path. Shape matches takeFeedback so the stream can build frames identically.
-  async peekFeedback(key) {
-    return this.withLock(async () => {
-      const state = await this.readState();
-      const session = state.sessions[key];
-      if (!session) {
-        return { status: "missing" };
-      }
-      const prompts = session.prompts || [];
-      const layoutWarnings = session.layout_warnings || [];
-      if (prompts.length === 0 && layoutWarnings.length === 0) {
-        return session.status === "ended" ? { status: "ended" } : { status: "waiting" };
-      }
-      return {
-        status: "feedback",
-        dom_snapshot: session.dom_snapshot || "",
-        prompts: [...prompts],
-        ...(layoutWarnings.length > 0 ? { layout_warnings: [...layoutWarnings] } : {}),
-      };
-    });
-  }
-
-  // Clear exactly the prefix a peekFeedback delivered: drop the first `prompts` queued items
-  // (anything queued during delivery sits at the tail and survives) and the delivered layout
-  // warnings. Called only after the batch was written to a live socket, so an interrupted delivery
-  // leaves the batch queued for the next stream/poll.
-  async ackFeedback(key, { prompts = 0, layoutWarnings = 0 } = {}) {
+  // Restore a batch the stream took (via takeFeedback) but couldn't deliver because the client
+  // dropped mid-drain, so the next stream/poll still gets it (C1 deliver-then-restore). takeFeedback
+  // is atomic — it clears the whole batch — so the stream never double-delivers under concurrent
+  // consumers and requeue never has to reason about a partial prefix. Prompts are prepended ahead of
+  // anything queued meanwhile (order preserved). Layout warnings and dom_snapshot are restored only
+  // when nothing fresher arrived: they are replace-semantics (a newer browser report wins), so we
+  // never clobber a fresh report with a stale restore.
+  async requeueFeedback(key, batch) {
     return this.withLock(async () => {
       const state = await this.readState();
       const session = state.sessions[key];
       if (!session) {
         return null;
       }
-      if (prompts > 0) {
-        session.prompts = (session.prompts || []).slice(prompts);
+      const prompts = Array.isArray(batch?.prompts) ? batch.prompts : [];
+      const layoutWarnings = Array.isArray(batch?.layout_warnings) ? batch.layout_warnings : [];
+      if (prompts.length > 0) {
+        session.prompts = [...prompts, ...(session.prompts || [])];
       }
-      if (layoutWarnings > 0) {
-        session.layout_warnings = (session.layout_warnings || []).slice(layoutWarnings);
+      if (layoutWarnings.length > 0 && (session.layout_warnings || []).length === 0) {
+        session.layout_warnings = layoutWarnings;
       }
-      const remainingPrompts = (session.prompts || []).length;
-      session.pending_prompts = remainingPrompts;
-      if (remainingPrompts === 0) {
-        session.dom_snapshot = "";
+      if (batch?.dom_snapshot && !session.dom_snapshot) {
+        session.dom_snapshot = String(batch.dom_snapshot);
       }
-      if (session.status !== "ended" && remainingPrompts === 0 && (session.layout_warnings || []).length === 0) {
-        session.status = "open";
+      session.pending_prompts = (session.prompts || []).length;
+      if (
+        session.status !== "ended" &&
+        ((session.prompts || []).length > 0 || (session.layout_warnings || []).length > 0)
+      ) {
+        session.status = "feedback";
       }
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
