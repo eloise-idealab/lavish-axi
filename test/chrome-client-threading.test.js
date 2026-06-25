@@ -78,6 +78,70 @@ test("optimistic user send renders immediately (before chat-sync)", async () => 
   assert.ok(chrome.threadingOrdered().length >= 1, "should have at least one message");
 });
 
+test("user's own message survives the agent draining the queue + chat-sync (disappearing-message regression)", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: JSON.parse(init.body) });
+      return { ok: true };
+    },
+  });
+
+  // 1. User types and sends — the message is optimistically echoed into the transcript.
+  chrome.element("chatInput").value = "hello agent";
+  chrome.element("send").onclick();
+  assert.equal(
+    chrome.threadingOrdered().filter((m) => m.text === "hello agent").length,
+    1,
+    "optimistic message renders immediately",
+  );
+
+  // 2. The snapshot round-trip drives POST /prompts (the message enters the agent's queue).
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  assert.ok(
+    posts.some((p) => p.url === "/api/abc/prompts"),
+    "the message was posted to the agent queue",
+  );
+
+  // 3. The agent consumes the queue and starts working (presence -> "working"). This is the moment
+  //    the message used to vanish; it MUST stay in the visible transcript.
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "working" }) });
+  assert.equal(
+    chrome.threadingOrdered().filter((m) => m.text === "hello agent").length,
+    1,
+    "message stays visible while the agent works on it",
+  );
+
+  // 4. The server re-broadcasts the authoritative transcript. Because queuePrompts mirrored the user
+  //    message into session.chat with a durable id and takeFeedback never clears chat, the sync still
+  //    carries it. Reconciliation must keep it (now with the server id), never drop it or duplicate it.
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "S1", role: "user", text: "hello agent", at: 1 }] }),
+  });
+  const afterSync = chrome.threadingOrdered().filter((m) => m.text === "hello agent");
+  assert.equal(afterSync.length, 1, "message persists through chat-sync (no disappearance, no dupe)");
+  assert.equal(afterSync[0].id, "S1", "optimistic local id reconciled to the durable server id");
+});
+
+test("Send button stays active and still posts while the agent is working (change #2)", async () => {
+  const chrome = await createChromeHarness();
+
+  // The agent took the previous batch and is busy: presence flips to "working".
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "working" }) });
+  assert.equal(chrome.element("send").disabled, false, "Send button is never grayed out while working");
+
+  // A message typed while "working" is still echoed into the transcript and queued for delivery.
+  chrome.element("chatInput").value = "another message";
+  chrome.element("send").onclick();
+  assert.equal(
+    chrome.threadingOrdered().filter((m) => m.text === "another message").length,
+    1,
+    "message sent while working is echoed into the transcript",
+  );
+  assert.equal(chrome.queued().length, 1, "message sent while working is queued for delivery");
+});
+
 test("formatRelativeTime renders coarse buckets", async () => {
   const { formatRelativeTime } = await threading();
   assert.equal(formatRelativeTime(1000, 1000), "just now");

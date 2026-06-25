@@ -301,6 +301,43 @@ test("freeform user prompts are stored in session chat history", async () => {
   }
 });
 
+test("a queued user message stays in chat history after the agent drains the queue (disappearing-message regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-drain-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+
+    await store.queuePrompts(session.key, {
+      prompts: [{ uid: "", prompt: "Keep me visible", selector: "", tag: "message", text: "Freeform message" }],
+    });
+
+    // The agent polls/streams and drains the queue — the moment the message "leaves" for the agent.
+    const drained = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(
+      drained.prompts.filter((p) => p.tag === "message").map((p) => p.prompt)[0],
+      "Keep me visible",
+      "the agent receives the message",
+    );
+
+    // The visible transcript (session.chat) MUST still hold the user's message: takeFeedback clears
+    // session.prompts only, never session.chat. This is the server-side guarantee that a sent message
+    // cannot vanish from the chat panel when the agent consumes it from the queue.
+    const after = await store.findByKey(session.key);
+    assert.deepEqual(
+      after.chat.map((item) => [item.role, item.text]),
+      [["user", "Keep me visible"]],
+      "user message persists in chat history after the drain",
+    );
+    assert.equal(after.prompts.length, 0, "queue is drained");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("concurrent takeFeedback and queuePrompts never drop or duplicate messages (BLOCKER regression)", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-race-"));
   try {
