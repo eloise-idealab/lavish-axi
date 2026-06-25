@@ -245,6 +245,12 @@ export async function createChromeHarness({
     threadingReplyTo(id, text) {
       return context.__lavishTest.setThreadReplyTarget(id, text);
     },
+    threadingBuildBubble(message, opts) {
+      return context.__lavishTest.buildBubble(message, opts);
+    },
+    threadingOrdered() {
+      return toHost(context.__lavishTest.orderedMessages());
+    },
   };
 }
 

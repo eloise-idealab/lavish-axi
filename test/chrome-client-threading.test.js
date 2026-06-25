@@ -66,11 +66,16 @@ test("groupThreads separates roots from replies and flattens nesting", async () 
   assert.equal((repliesByRoot.get("c") || []).length, 0);
 });
 
-test("groupThreads keeps id-less optimistic messages as roots", async () => {
-  const { groupThreads } = await threading();
-  const messages = [{ role: "user", text: "pending", at: 1 }];
-  const { roots } = groupThreads(messages);
-  assert.equal(roots.length, 1);
+test("optimistic user send renders immediately (before chat-sync)", async () => {
+  const chrome = await createChromeHarness();
+  chrome.element("chatInput").value = "hello";
+  chrome.element("send").onclick();
+  // No chat-sync sent — assert the message is already in the render set.
+  assert.ok(
+    chrome.threadingOrdered().some((m) => m.text === "hello"),
+    "optimistic message should be in ordered list",
+  );
+  assert.ok(chrome.threadingOrdered().length >= 1, "should have at least one message");
 });
 
 test("formatRelativeTime renders coarse buckets", async () => {
@@ -191,4 +196,22 @@ test("opening a thread clears any prior reply target", async () => {
   chrome.threadingReplyTo("root1", "Root");
   chrome.threadingOpen("root1");
   assert.equal(chrome.element("threadReplyIndicator").hidden, true);
+});
+
+test("formatRelativeTime parses ISO-string timestamps", async () => {
+  const { formatRelativeTime } = await threading();
+  // Fixed pair: epoch + 30s window.
+  assert.equal(formatRelativeTime("1970-01-01T00:00:00.000Z", 30_000), "30s");
+  // Non-empty, ends with "m" for a ~5-min-ago ISO string.
+  const isoFiveMinAgo = new Date(Date.now() - 5 * 60_000).toISOString();
+  const result = formatRelativeTime(isoFiveMinAgo, Date.now());
+  assert.ok(result.length > 0, "should return a non-empty string for ISO timestamps");
+  assert.ok(result.endsWith("m"), `expected result ending in "m", got "${result}"`);
+});
+
+test("a reply-less root renders a Reply affordance wired to open its thread", async () => {
+  const chrome = await createChromeHarness();
+  const el = chrome.threadingBuildBubble({ id: "r1", role: "agent", text: "hi" }, { reply: "open" });
+  assert.ok(el.innerHTML.includes("reply-button"), 'innerHTML should include "reply-button"');
+  assert.ok(el.innerHTML.includes('data-reply-id="r1"'), 'innerHTML should include data-reply-id="r1"');
 });

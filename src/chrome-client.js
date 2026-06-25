@@ -64,6 +64,7 @@ const threadReplyIndicatorClear = /** @type {HTMLButtonElement} */ (
   document.getElementById("threadReplyIndicatorClear")
 );
 let threadReplyToId = "";
+let localMessageSeq = 0;
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
 const layoutGateMaxHoldMs =
@@ -161,9 +162,9 @@ function groupThreads(messages) {
 }
 
 // Coarse relative time for thread chips ("just now", "30s", "5m", "3h", "2d").
-/** @param {number} at @param {number} now @returns {string} */
+/** @param {number|string} at @param {number} now @returns {string} */
 function formatRelativeTime(at, now) {
-  const t = Number(at);
+  const t = typeof at === "number" ? at : Date.parse(String(at));
   if (!Number.isFinite(t)) return "";
   const s = Math.max(0, Math.floor((now - t) / 1000));
   if (s < 5) return "just now";
@@ -299,8 +300,15 @@ async function copyText(text) {
   return true;
 }
 
-// Build one chat bubble element. `withChip` adds a thread chip to a root that has replies; `inThread`
-// renders without a Reply affordance (the thread composer is the reply path) and pins the root.
+// Build one chat bubble element. `chip` adds a thread chip to a root that has replies.
+// `reply` is a tri-state:
+//   false   — no reply button
+//   "open"  — Reply button whose click calls openThread (for main-list roots with no replies)
+//   "target"— Reply button whose click calls setThreadReplyTarget (for thread bubbles)
+/**
+ * @param {ChatMsg} message
+ * @param {{ chip?: string|null, isRoot?: boolean, reply?: false|"open"|"target" }} [opts]
+ */
 function buildBubble(message, { chip = null, isRoot = false, reply = false } = {}) {
   const el = document.createElement("div");
   el.className = "bubble " + message.role + (isRoot ? " thread-root" : "");
@@ -325,7 +333,13 @@ function buildBubble(message, { chip = null, isRoot = false, reply = false } = {
   const chipButton = el.querySelector(".thread-chip");
   if (chipButton) chipButton.addEventListener("click", () => openThread(String(message.id)));
   const replyButton = el.querySelector(".reply-button");
-  if (replyButton) replyButton.addEventListener("click", () => setThreadReplyTarget(String(message.id), message.text));
+  if (replyButton) {
+    if (reply === "open") {
+      replyButton.addEventListener("click", () => openThread(String(message.id)));
+    } else {
+      replyButton.addEventListener("click", () => setThreadReplyTarget(String(message.id), message.text));
+    }
+  }
   return el;
 }
 
@@ -382,11 +396,15 @@ function renderChat() {
     const id = root.id != null ? String(root.id) : "";
     const replies = id ? repliesByRoot.get(id) || [] : [];
     let chip = null;
+    /** @type {false|"open"|"target"} */
+    let reply = false;
     if (replies.length) {
       const lastAt = replies[replies.length - 1].at;
       chip = threadChipLabel(replies.length, lastAt, now);
+    } else {
+      reply = "open";
     }
-    chatLog.insertBefore(buildBubble(root, { chip }), reference);
+    chatLog.insertBefore(buildBubble(root, { chip, reply }), reference);
   }
   chatLog.scrollTop = chatLog.scrollHeight;
 }
@@ -401,8 +419,8 @@ function renderThread(rootId) {
   threadTitle.textContent = replies.length
     ? threadChipLabel(replies.length, replies[replies.length - 1].at, Date.now())
     : "Thread";
-  threadChat.appendChild(buildBubble(root, { isRoot: true, reply: true }));
-  for (const reply of replies) threadChat.appendChild(buildBubble(reply, { reply: true }));
+  threadChat.appendChild(buildBubble(root, { isRoot: true, reply: "target" }));
+  for (const reply of replies) threadChat.appendChild(buildBubble(reply, { reply: "target" }));
   threadChat.scrollTop = threadChat.scrollHeight;
 }
 
@@ -538,7 +556,7 @@ function sendQueued(endAfter) {
     const message = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
     queued.push(message);
     persistQueuedPrompts();
-    rememberMessage({ role: "user", text });
+    rememberMessage({ id: "local-" + ++localMessageSeq, role: "user", text, at: Date.now() });
     renderChat();
     if (workingBubble) chatLog.appendChild(workingBubble);
     chatInput.value = "";
@@ -568,7 +586,7 @@ function sendThreadReply() {
   const message = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message", reply_to: replyTo };
   queued.push(message);
   persistQueuedPrompts();
-  rememberMessage({ role: "user", text, reply_to: replyTo });
+  rememberMessage({ id: "local-" + ++localMessageSeq, role: "user", text, reply_to: replyTo, at: Date.now() });
   renderChat();
   if (workingBubble) chatLog.appendChild(workingBubble);
   renderThread(openThreadRootId);
@@ -938,4 +956,6 @@ if (globalThis.__lavishTest) {
   };
   globalThis.__lavishTest.openThread = openThread;
   globalThis.__lavishTest.setThreadReplyTarget = setThreadReplyTarget;
+  globalThis.__lavishTest.buildBubble = buildBubble;
+  globalThis.__lavishTest.orderedMessages = orderedMessages;
 }
