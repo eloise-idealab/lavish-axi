@@ -561,16 +561,6 @@ body.lavish {
   color: var(--accent);
   border-color: var(--accent);
 }
-.reply-quote {
-  margin-bottom: 6px;
-  padding: 4px 8px;
-  border-left: 2px solid var(--accent);
-  background: var(--bg-elevated);
-  border-radius: var(--radius-md, 6px);
-  color: var(--fg-muted);
-  font-size: 11px;
-  line-height: 1.35;
-}
 .reply-indicator[hidden] {
   display: none;
 }
