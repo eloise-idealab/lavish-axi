@@ -536,6 +536,8 @@ git commit -m "feat(ui): thread-panel styles (slide-out pane, chip, Back button 
 
 Replace the flat renderer with the threaded model and wire the slide-out.
 
+> **Coupling note:** Tasks 4 and 5 jointly rewrite `chrome-client.js`'s chat/compose logic and are executed by a single implementer dispatch. Task 4 in isolation would not lint-clean, because removing the `replyToId`/`clearReplyTarget` declarations (Step 1/2) leaves the old `sendQueued` referencing them until Task 5's `sendQueued` rewrite. When implementing, apply Task 4 then Task 5 and ensure each commit passes `npm run check` — in practice the `sendQueued` rewrite (Task 5, Step 4) and the dead `replyIndicatorClear` wiring removal (Task 5, Step 5) must land in the SAME commit as the Task 4 state-block/render changes that orphan those symbols.
+
 **Files:**
 - Modify: `src/chrome-client.js` (state block ~lines 46–52; `addChat`/`syncChat` ~lines 210–272; new render/open/close functions; element refs)
 
