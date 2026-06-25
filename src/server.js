@@ -283,10 +283,18 @@ export async function serve({
             // multiple consumers: only one stream can take a given batch, so no double-delivery.
             if (closed || req.destroyed) {
               // Detected disconnect: restore the batch and wake any other open consumer. `stopped`
-              // keeps this dead stream's own re-drain from looping on the re-emitted event.
+              // keeps this dead stream's own re-drain from looping on the re-emitted event. The drain
+              // is fire-and-forget (drain().catch(noop)), and takeFeedback already cleared this batch,
+              // so a requeue failure here would silently lose it — surface it instead of swallowing.
               stopped = true;
-              await store.requeueFeedback(key, batch);
-              events.emit("feedback", key);
+              try {
+                await store.requeueFeedback(key, batch);
+                events.emit("feedback", key);
+              } catch (error) {
+                writeLog(
+                  `[lavish] stream requeue failed key=${key}: ${error instanceof Error ? error.message : error}`,
+                );
+              }
               return;
             }
             markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
@@ -312,8 +320,14 @@ export async function serve({
               // Requeue the tail WITH the batch's dom_snapshot so the next consumer keeps the DOM
               // context that produced those messages.
               if (rest.length > 0) {
-                await store.requeueFeedback(key, { prompts: rest, dom_snapshot: dom });
-                events.emit("feedback", key);
+                try {
+                  await store.requeueFeedback(key, { prompts: rest, dom_snapshot: dom });
+                  events.emit("feedback", key);
+                } catch (error) {
+                  writeLog(
+                    `[lavish] stream once-tail requeue failed key=${key}: ${error instanceof Error ? error.message : error}`,
+                  );
+                }
               }
               stopped = true;
               if (!res.writableEnded) res.end();
