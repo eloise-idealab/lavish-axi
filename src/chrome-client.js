@@ -100,6 +100,84 @@ function renderInlineMarkdown(text) {
   return html;
 }
 
+/**
+ * @typedef {{ id?: string, role: string, text: string, reply_to?: string, at?: number }} ChatMsg
+ */
+
+// Walk reply_to up to the thread root id. Cycle- and dangling-safe: returns the topmost id with no
+// reply_to, or the current id if the chain loops or points at a missing message.
+/** @param {string} id @param {Map<string, ChatMsg>} byId @returns {string} */
+function resolveRootId(id, byId) {
+  const seen = new Set();
+  let curId = String(id);
+  for (;;) {
+    if (seen.has(curId)) return curId;
+    seen.add(curId);
+    const current = byId.get(curId);
+    if (!current || !current.reply_to) return curId;
+    const parentId = String(current.reply_to);
+    if (!byId.has(parentId)) return curId;
+    curId = parentId;
+  }
+}
+
+// Split a flat, chronological transcript into roots (no reply_to) and replies grouped under their
+// resolved root. One level deep: nested replies land flat under the same root.
+/** @param {ChatMsg[]} messages @returns {{ roots: ChatMsg[], repliesByRoot: Map<string, ChatMsg[]> }} */
+function groupThreads(messages) {
+  const byId = new Map();
+  for (const m of messages) {
+    if (m && m.id != null && m.id !== "") byId.set(String(m.id), m);
+  }
+  const roots = [];
+  const repliesByRoot = new Map();
+  for (const m of messages) {
+    if (!m) continue;
+    const id = m.id != null ? String(m.id) : "";
+    const rootId = id ? resolveRootId(id, byId) : "";
+    if (!id || !m.reply_to || rootId === id) {
+      roots.push(m);
+      if (id && !repliesByRoot.has(id)) repliesByRoot.set(id, []);
+      continue;
+    }
+    if (!repliesByRoot.has(rootId)) repliesByRoot.set(rootId, []);
+    (repliesByRoot.get(rootId) || []).push(m);
+  }
+  return { roots, repliesByRoot };
+}
+
+// Coarse relative time for thread chips ("just now", "30s", "5m", "3h", "2d").
+/** @param {number} at @param {number} now @returns {string} */
+function formatRelativeTime(at, now) {
+  const t = Number(at);
+  if (!Number.isFinite(t)) return "";
+  const s = Math.max(0, Math.floor((now - t) / 1000));
+  if (s < 5) return "just now";
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+/** @param {number} count @param {number} lastAt @param {number} now @returns {string} */
+function threadChipLabel(count, lastAt, now) {
+  const noun = count === 1 ? "reply" : "replies";
+  const rel = formatRelativeTime(lastAt, now);
+  return rel ? `${count} ${noun} · ${rel}` : `${count} ${noun}`;
+}
+
+// True when a thread is open and an incoming message belongs to a different thread/root, so the
+// Back button should show an unread badge.
+/** @param {string} openRootId @param {ChatMsg} message @param {Map<string, ChatMsg>} byId @returns {boolean} */
+function shouldFlagBackBadge(openRootId, message, byId) {
+  if (!openRootId) return false;
+  const id = message && message.id != null ? String(message.id) : "";
+  if (!id) return false;
+  return resolveRootId(id, byId) !== String(openRootId);
+}
+
 function loadQueuedPrompts() {
   try {
     const parsed = JSON.parse(sessionStorage.getItem(queueStorageKey) || "[]");
@@ -686,3 +764,15 @@ if (replyIndicatorClear) replyIndicatorClear.onclick = () => clearReplyTarget();
 render();
 initialChat.forEach((item) => addChat(item.role, item.text, { id: item.id, reply_to: item.reply_to }));
 setAgentPresence("waiting");
+
+// Test seam: a harness pre-seeds globalThis.__lavishTest, letting the pure threading helpers be
+// unit-tested without a DOM. No-op in the browser, where the key is never set.
+if (globalThis.__lavishTest) {
+  globalThis.__lavishTest.threading = {
+    resolveRootId,
+    groupThreads,
+    formatRelativeTime,
+    threadChipLabel,
+    shouldFlagBackBadge,
+  };
+}
