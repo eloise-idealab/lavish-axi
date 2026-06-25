@@ -472,7 +472,8 @@ test("chrome bootstraps persisted chat history so missed replies still appear", 
 test("chrome client renders persisted chat history", async () => {
   const js = await chromeClientSource();
 
-  assert.match(js, /initialChat\.forEach/);
+  // Tasks 4+5 replaced initialChat.forEach(addChat) with syncChat(initialChat).
+  assert.match(js, /syncChat\(initialChat\)/);
 });
 
 test("chrome can sync persisted chat after the event stream reconnects", async () => {
@@ -2043,15 +2044,18 @@ test("agent-reply broadcasts a message id and threads via reply_to (change #3)",
   }
 });
 
-test("chrome client renders reply affordance and threading (change #3)", async () => {
+test("chrome client renders threaded model and thread composer (Tasks 4+5)", async () => {
   const js = await chromeClientSource();
   const css = await chromeCssSource();
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
 
-  assert.match(js, /let replyToId = ""/);
-  assert.match(js, /function setReplyTarget\(/);
-  assert.match(js, /class="reply-button"/);
-  assert.match(js, /message\.reply_to = replyToId/);
+  // Tasks 4+5 replaced the flat replyToId model with a full threaded model.
+  assert.match(js, /const messagesById = new Map\(\)/);
+  assert.match(js, /function buildBubble\(/);
+  assert.match(js, /function renderChat\(\)/);
+  assert.match(js, /function openThread\(/);
+  assert.match(js, /function sendThreadReply\(\)/);
+  assert.match(js, /reply_to: replyTo/);
   assert.match(html, /id="threadReplyIndicator"/);
   assert.match(css, /\.reply-button\{/);
   assert.match(css, /\.reply-indicator\{/);

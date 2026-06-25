@@ -43,13 +43,27 @@ let annotation = true;
 let ended = false;
 let agentPresence = "waiting";
 let pendingSnapshot = "";
-// Change #3 (threading): id of the agent message the next user message replies to ("" = no thread),
-// and a lookup of rendered agent message text by id for the quoted-snippet preview.
-let replyToId = "";
-const chatMessages = new Map();
-const replyIndicator = /** @type {HTMLDivElement} */ (document.getElementById("replyIndicator"));
-const replyIndicatorText = /** @type {HTMLSpanElement} */ (document.getElementById("replyIndicatorText"));
-const replyIndicatorClear = /** @type {HTMLButtonElement} */ (document.getElementById("replyIndicatorClear"));
+// Threading: full client model rebuilt from the authoritative transcript, plus the id of the root
+// whose thread is currently open ("" = none).
+/** @type {Map<string, ChatMsg>} */
+const messagesById = new Map();
+/** @type {string[]} */
+const messageOrder = [];
+let openThreadRootId = "";
+const chatPane = /** @type {HTMLDivElement} */ (document.getElementById("chatPane"));
+const panel = chatPane?.parentElement || null;
+const threadChat = /** @type {HTMLDivElement} */ (document.getElementById("threadChat"));
+const threadTitle = /** @type {HTMLSpanElement} */ (document.getElementById("threadTitle"));
+const threadBack = /** @type {HTMLButtonElement} */ (document.getElementById("threadBack"));
+const backBadge = /** @type {HTMLSpanElement} */ (document.getElementById("backBadge"));
+const threadInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("threadInput"));
+const threadSend = /** @type {HTMLButtonElement} */ (document.getElementById("threadSend"));
+const threadReplyIndicator = /** @type {HTMLDivElement} */ (document.getElementById("threadReplyIndicator"));
+// threadReplyIndicatorText is wired in Task 6 when setThreadReplyTarget is added.
+const threadReplyIndicatorClear = /** @type {HTMLButtonElement} */ (
+  document.getElementById("threadReplyIndicatorClear")
+);
+let threadReplyToId = "";
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
 const layoutGateMaxHoldMs =
@@ -285,68 +299,141 @@ async function copyText(text) {
   return true;
 }
 
-function addChat(role, text, meta = {}) {
-  if (!text) return;
-
+// Build one chat bubble element. `withChip` adds a thread chip to a root that has replies; `inThread`
+// renders without a Reply affordance (the thread composer is the reply path) and pins the root.
+function buildBubble(message, { chip = null, isRoot = false } = {}) {
   const el = document.createElement("div");
-  el.className = "bubble " + role;
-  if (meta.id) {
-    el.dataset.messageId = String(meta.id);
-    // Store every message (user and agent) so any of them can be quoted and replied to.
-    chatMessages.set(String(meta.id), text);
+  el.className = "bubble " + message.role + (isRoot ? " thread-root" : "");
+  if (message.id) el.dataset.messageId = String(message.id);
+  const body = message.role === "agent" ? renderInlineMarkdown(message.text) : escapeHtml(message.text);
+  let html = "<small>" + (message.role === "agent" ? "Agent" : "You") + "</small><div>" + body + "</div>";
+  if (chip) {
+    html +=
+      '<button class="thread-chip" type="button" data-root-id="' +
+      escapeHtml(String(message.id)) +
+      '">' +
+      escapeHtml(chip) +
+      "</button>";
   }
-  // Change #3 (threading): show which earlier message this one replies to, as a quoted snippet.
-  let threadHtml = "";
-  if (meta.reply_to) {
-    const quoted = chatMessages.get(String(meta.reply_to));
-    if (quoted) {
-      threadHtml = '<div class="reply-quote">' + escapeHtml(truncateQuote(quoted)) + "</div>";
+  el.innerHTML = html;
+  const chipButton = el.querySelector(".thread-chip");
+  if (chipButton) chipButton.addEventListener("click", () => openThread(String(message.id)));
+  return el;
+}
+
+// Append a message to the in-memory model (used for optimistic local sends and incoming events).
+function rememberMessage(message) {
+  if (!message) return;
+  const id = message.id != null ? String(message.id) : "";
+  if (id) {
+    if (!messagesById.has(id)) messageOrder.push(id);
+    messagesById.set(id, message);
+  } else {
+    messageOrder.push("");
+  }
+}
+
+// Rebuild the whole model from the authoritative transcript.
+function setMessages(chat) {
+  messagesById.clear();
+  messageOrder.length = 0;
+  for (const item of chat) {
+    rememberMessage({
+      id: item.id,
+      role: item.role,
+      text: item.text,
+      reply_to: item.reply_to,
+      at: item.at,
+    });
+  }
+}
+
+function orderedMessages() {
+  const seen = new Set();
+  const list = [];
+  for (const id of messageOrder) {
+    if (id) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const m = messagesById.get(id);
+      if (m) list.push(m);
     }
   }
-  // Every message with an id gets a Reply affordance so you can thread under your own messages too.
-  const replyHtml = meta.id
-    ? '<button class="reply-button" type="button" data-reply-id="' + escapeHtml(String(meta.id)) + '">Reply</button>'
-    : "";
-  // Agent messages render a safe subset of markdown (**bold**, *italic*, `code`); user text stays plain.
-  const body = role === "agent" ? renderInlineMarkdown(text) : escapeHtml(text);
-  el.innerHTML =
-    "<small>" + (role === "agent" ? "Agent" : "You") + "</small>" + threadHtml + "<div>" + body + "</div>" + replyHtml;
-  const replyButton = el.querySelector(".reply-button");
-  if (replyButton) {
-    replyButton.addEventListener("click", () => setReplyTarget(String(meta.id), text));
-  }
-  chatLog.appendChild(el);
-  chatLog.scrollTop = chatLog.scrollHeight;
+  return list;
 }
 
-function truncateQuote(text) {
-  const trimmed = String(text).replace(/\s+/g, " ").trim();
-  return trimmed.length > 120 ? trimmed.slice(0, 117) + "..." : trimmed;
-}
-
-function setReplyTarget(id, text) {
-  replyToId = id;
-  if (replyIndicator) {
-    replyIndicatorText.textContent = truncateQuote(text);
-    replyIndicator.hidden = false;
-  }
-  chatInput.focus();
-}
-
-function clearReplyTarget() {
-  replyToId = "";
-  if (replyIndicator) replyIndicator.hidden = true;
-}
-
-function syncChat(chat) {
+// Render only roots into the main list, each with a thread chip when it has replies.
+function renderChat() {
   for (const el of [...chatLog.querySelectorAll(".bubble.user,.bubble.agent:not(.agent-working)")]) {
     el.remove();
   }
-
-  chatMessages.clear();
-  for (const item of chat) addChat(item.role, item.text, { id: item.id, reply_to: item.reply_to });
-  if (workingBubble) chatLog.appendChild(workingBubble);
+  const { roots, repliesByRoot } = groupThreads(orderedMessages());
+  const now = Date.now();
+  const reference = workingBubble && workingBubble.parentElement === chatLog ? workingBubble : null;
+  for (const root of roots) {
+    const id = root.id != null ? String(root.id) : "";
+    const replies = id ? repliesByRoot.get(id) || [] : [];
+    let chip = null;
+    if (replies.length) {
+      const lastAt = replies[replies.length - 1].at;
+      chip = threadChipLabel(replies.length, lastAt, now);
+    }
+    chatLog.insertBefore(buildBubble(root, { chip }), reference);
+  }
   chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+// Render the open thread: pinned root, a count rule, then replies in time order.
+function renderThread(rootId) {
+  threadChat.innerHTML = "";
+  const root = messagesById.get(String(rootId));
+  if (!root) return;
+  const { repliesByRoot } = groupThreads(orderedMessages());
+  const replies = repliesByRoot.get(String(rootId)) || [];
+  threadTitle.textContent = replies.length
+    ? threadChipLabel(replies.length, replies[replies.length - 1].at, Date.now())
+    : "Thread";
+  threadChat.appendChild(buildBubble(root, { isRoot: true }));
+  for (const reply of replies) threadChat.appendChild(buildBubble(reply));
+  threadChat.scrollTop = threadChat.scrollHeight;
+}
+
+function setBackBadge(visible) {
+  if (!backBadge) return;
+  backBadge.hidden = !visible;
+  if (visible) backBadge.textContent = "new";
+}
+
+function openThread(rootId) {
+  openThreadRootId = String(rootId);
+  clearThreadReplyTarget();
+  renderThread(openThreadRootId);
+  setBackBadge(false);
+  if (panel) panel.classList.add("thread-open");
+  if (threadInput) threadInput.focus();
+}
+
+function closeThread() {
+  openThreadRootId = "";
+  setBackBadge(false);
+  if (panel) panel.classList.remove("thread-open");
+}
+
+// Re-render the list and, if a thread is open, the thread view, from the current model.
+function syncChat(chat) {
+  setMessages(chat);
+  renderChat();
+  if (workingBubble) chatLog.appendChild(workingBubble);
+  if (openThreadRootId) {
+    if (messagesById.has(openThreadRootId)) renderThread(openThreadRootId);
+    else closeThread();
+  }
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function clearThreadReplyTarget() {
+  threadReplyToId = "";
+  if (threadReplyIndicator) threadReplyIndicator.hidden = true;
 }
 
 function setAgentPresence(state) {
@@ -424,15 +511,11 @@ function sendQueued(endAfter) {
   const text = chatInput.value.trim();
   if (text) {
     const message = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
-    // Change #3 (threading): if the user is replying to a specific agent bubble, carry its id so the
-    // agent receives `reply_to` and the transcript renders the message under that thread.
-    if (replyToId) {
-      message.reply_to = replyToId;
-    }
     queued.push(message);
     persistQueuedPrompts();
-    addChat("user", text, { reply_to: replyToId });
-    clearReplyTarget();
+    rememberMessage({ role: "user", text });
+    renderChat();
+    if (workingBubble) chatLog.appendChild(workingBubble);
     chatInput.value = "";
     render();
   }
@@ -447,6 +530,26 @@ function sendQueued(endAfter) {
   hideSendHint();
 
   if (endAfter) endAfterSubmit = true;
+  requestSnapshot("submit");
+}
+
+// Send a reply from the thread composer. Carries reply_to (the targeted sub-message, or the open
+// thread's root) so the server threads it and the agent sees what it answered.
+function sendThreadReply() {
+  if (ended || !openThreadRootId) return;
+  const text = threadInput.value.trim();
+  if (!text) return;
+  const replyTo = threadReplyToId || openThreadRootId;
+  const message = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message", reply_to: replyTo };
+  queued.push(message);
+  persistQueuedPrompts();
+  rememberMessage({ role: "user", text, reply_to: replyTo });
+  renderChat();
+  if (workingBubble) chatLog.appendChild(workingBubble);
+  renderThread(openThreadRootId);
+  threadInput.value = "";
+  clearThreadReplyTarget();
+  render();
   requestSnapshot("submit");
 }
 
@@ -726,6 +829,16 @@ chatInput.addEventListener("keydown", (event) => {
   }
 });
 chatInput.addEventListener("input", hideSendHint);
+if (threadSend) threadSend.onclick = () => sendThreadReply();
+if (threadInput) {
+  threadInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      sendThreadReply();
+    }
+  });
+}
+if (threadReplyIndicatorClear) threadReplyIndicatorClear.onclick = () => clearThreadReplyTarget();
 copyPathButton.onclick = copyFilePath;
 reloadArtifactButton.onclick = reloadArtifact;
 copySnapshotButton.onclick = copyDomSnapshot;
@@ -749,20 +862,28 @@ frame.addEventListener("load", () => {
 
 initializeLayoutGate();
 
+function ingestIncoming(message) {
+  if (!message || !message.text) return;
+  rememberMessage(message);
+  renderChat();
+  if (workingBubble) chatLog.appendChild(workingBubble);
+  if (openThreadRootId) renderThread(openThreadRootId);
+}
+
 const events = new EventSource("/events/" + key);
 events.addEventListener("reload", () => resetFrame());
 events.addEventListener("chrome-reload", () => reloadAfterServerRestart());
 events.addEventListener("agent-reply", (event) => {
   const data = JSON.parse(event.data);
-  addChat("agent", data.text, { id: data.id, reply_to: data.reply_to });
+  ingestIncoming({ id: data.id, role: "agent", text: data.text, reply_to: data.reply_to, at: data.at });
 });
 events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
 events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
 
-if (replyIndicatorClear) replyIndicatorClear.onclick = () => clearReplyTarget();
+if (threadBack) threadBack.addEventListener("click", () => closeThread());
 
 render();
-initialChat.forEach((item) => addChat(item.role, item.text, { id: item.id, reply_to: item.reply_to }));
+syncChat(initialChat);
 setAgentPresence("waiting");
 
 // Test seam: a harness pre-seeds globalThis.__lavishTest, letting the pure threading helpers be
@@ -775,4 +896,5 @@ if (globalThis.__lavishTest) {
     threadChipLabel,
     shouldFlagBackBadge,
   };
+  globalThis.__lavishTest.openThread = openThread;
 }
