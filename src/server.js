@@ -193,10 +193,17 @@ export async function serve({
             return;
           }
           if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
-          if (streamHeartbeat) {
-            res.end(JSON.stringify(result));
-          } else {
-            res.json(result);
+          try {
+            if (streamHeartbeat) {
+              res.end(JSON.stringify(result));
+            } else {
+              res.json(result);
+            }
+          } catch (error) {
+            // Synchronous write failure after taking the batch — requeue it (symmetry with the
+            // immediate path) so the next poll/stream still gets it, then surface the error.
+            if (result.status === "feedback") await requeueAndWake(result);
+            throw error;
           }
         } finally {
           cleanup();
