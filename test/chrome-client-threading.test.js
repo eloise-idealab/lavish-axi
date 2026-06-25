@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createChromeHarness } from "./helpers/chrome-harness.js";
+import { createChromeHarness, flushPromises } from "./helpers/chrome-harness.js";
 
 async function threading() {
   const chrome = await createChromeHarness();
@@ -100,4 +100,28 @@ test("shouldFlagBackBadge is true only for activity outside the open thread", as
   assert.equal(shouldFlagBackBadge("a", byId.get("b"), byId), false); // same thread
   assert.equal(shouldFlagBackBadge("a", byId.get("c"), byId), true); // different root
   assert.equal(shouldFlagBackBadge("", byId.get("c"), byId), false); // no thread open
+});
+
+test("thread composer posts a reply carrying reply_to", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: JSON.parse(init.body) });
+      return { ok: true };
+    },
+  });
+
+  // Seed a root via the transcript, open its thread, type a reply, send through the snapshot path.
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root message", at: 1 }] }),
+  });
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "A threaded reply";
+  chrome.element("threadSend").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  const replyPost = posts.find((p) => p.url === "/api/abc/prompts");
+  assert.ok(replyPost, "a prompts POST was made");
+  assert.equal(replyPost.body.prompts[0].reply_to, "root1");
 });

@@ -115,10 +115,17 @@ export async function createChromeHarness({
       addEventListener(type, handler) {
         listeners.set(type, handler);
       },
+      querySelector() {
+        return null;
+      },
       querySelectorAll() {
         return [];
       },
       appendChild(child) {
+        child.parentElement = this;
+        return child;
+      },
+      insertBefore(child) {
         child.parentElement = this;
         return child;
       },
@@ -231,6 +238,9 @@ export async function createChromeHarness({
         wrapped[k] = typeof v === "function" ? wrapVmFn(v) : v;
       }
       return wrapped;
+    },
+    threadingOpen(id) {
+      return context.__lavishTest.openThread(id);
     },
   };
 }
