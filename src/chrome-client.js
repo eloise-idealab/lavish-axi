@@ -88,6 +88,13 @@ let copyHintTimer;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendHintTimer;
 
+// Returns true for optimistic/unreconciled messages whose id was minted client-side ("local-<n>").
+// These must not be threadable or targetable until a chat-sync round-trip replaces the id with a
+// server-assigned durable id.
+function isLocalId(id) {
+  return typeof id === "string" && id.startsWith("local-");
+}
+
 function escapeHtml(value) {
   return String(value).replace(
     /[&<>"']/g,
@@ -323,7 +330,7 @@ function buildBubble(message, { chip = null, isRoot = false, reply = false } = {
       escapeHtml(chip) +
       "</button>";
   }
-  if (reply && message.id) {
+  if (reply && message.id && !isLocalId(String(message.id))) {
     html +=
       '<button class="reply-button" type="button" data-reply-id="' +
       escapeHtml(String(message.id)) +
@@ -471,6 +478,7 @@ function truncateQuote(text) {
 // Point the thread composer at a specific message. Shows the reply indicator so the user sees
 // what they are replying to, then focuses the thread input.
 function setThreadReplyTarget(id, text) {
+  if (isLocalId(String(id))) return;
   threadReplyToId = String(id);
   if (threadReplyIndicator) {
     if (threadReplyIndicatorText) threadReplyIndicatorText.textContent = truncateQuote(text);
@@ -583,10 +591,23 @@ function sendThreadReply() {
   const text = threadInput.value.trim();
   if (!text) return;
   const replyTo = threadReplyToId || openThreadRootId;
-  const message = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message", reply_to: replyTo };
+  // Defense-in-depth: never forward a local (optimistic) id as reply_to to the server.
+  // In normal flow setThreadReplyTarget already rejects local ids, but guard here too.
+  const safeReplyTo = isLocalId(replyTo) ? undefined : replyTo;
+  const message = {
+    uid: "",
+    prompt: text,
+    selector: "",
+    tag: "message",
+    text: "Freeform message",
+    reply_to: safeReplyTo,
+  };
+  if (!safeReplyTo) delete message.reply_to;
   queued.push(message);
   persistQueuedPrompts();
-  rememberMessage({ id: "local-" + ++localMessageSeq, role: "user", text, reply_to: replyTo, at: Date.now() });
+  const localMsg = { id: "local-" + ++localMessageSeq, role: "user", text, at: Date.now() };
+  if (safeReplyTo) localMsg.reply_to = safeReplyTo;
+  rememberMessage(localMsg);
   renderChat();
   if (workingBubble) chatLog.appendChild(workingBubble);
   renderThread(openThreadRootId);

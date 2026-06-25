@@ -2055,7 +2055,7 @@ test("chrome client renders threaded model and thread composer (Tasks 4+5)", asy
   assert.match(js, /function renderChat\(\)/);
   assert.match(js, /function openThread\(/);
   assert.match(js, /function sendThreadReply\(\)/);
-  assert.match(js, /reply_to: replyTo/);
+  assert.match(js, /reply_to: safeReplyTo/);
   assert.match(html, /id="threadReplyIndicator"/);
   assert.match(css, /\.reply-button\{/);
   assert.match(css, /\.reply-indicator\{/);

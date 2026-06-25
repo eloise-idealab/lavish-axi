@@ -215,3 +215,58 @@ test("a reply-less root renders a Reply affordance wired to open its thread", as
   assert.ok(el.innerHTML.includes("reply-button"), 'innerHTML should include "reply-button"');
   assert.ok(el.innerHTML.includes('data-reply-id="r1"'), 'innerHTML should include data-reply-id="r1"');
 });
+
+test("optimistic (local-) bubbles render no reply affordance for reply:open", async () => {
+  const chrome = await createChromeHarness();
+  const el = chrome.threadingBuildBubble({ id: "local-7", role: "user", text: "pending" }, { reply: "open" });
+  assert.ok(
+    !el.innerHTML.includes("reply-button"),
+    'optimistic bubble should NOT include "reply-button" for reply:open',
+  );
+});
+
+test("optimistic (local-) bubbles render no reply affordance for reply:target", async () => {
+  const chrome = await createChromeHarness();
+  const el = chrome.threadingBuildBubble({ id: "local-7", role: "user", text: "pending" }, { reply: "target" });
+  assert.ok(
+    !el.innerHTML.includes("reply-button"),
+    'optimistic bubble should NOT include "reply-button" for reply:target',
+  );
+});
+
+test("a durable root still renders its reply affordance", async () => {
+  const chrome = await createChromeHarness();
+  const el = chrome.threadingBuildBubble({ id: "root1", role: "agent", text: "hi" }, { reply: "open" });
+  assert.ok(el.innerHTML.includes("reply-button"), 'durable root should include "reply-button"');
+  assert.ok(el.innerHTML.includes('data-reply-id="root1"'), 'durable root should include data-reply-id="root1"');
+});
+
+test("setThreadReplyTarget ignores a local id and post uses the open root id", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: JSON.parse(init.body) });
+      return { ok: true };
+    },
+  });
+
+  // Seed a root, open its thread.
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root message", at: 1 }] }),
+  });
+  chrome.threadingOpen("root1");
+
+  // Attempt to target a local (optimistic) id — should be silently ignored.
+  chrome.threadingReplyTo("local-9", "pending message");
+
+  // Send a reply — should fall back to the open root id.
+  chrome.element("threadInput").value = "my reply";
+  chrome.element("threadSend").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  const replyPost = posts.find((p) => p.url === "/api/abc/prompts");
+  assert.ok(replyPost, "a prompts POST was made");
+  // reply_to must be the open root id, NOT "local-9".
+  assert.equal(replyPost.body.prompts[0].reply_to, "root1", "reply_to should be the root id, not the local id");
+});
