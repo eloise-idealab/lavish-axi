@@ -59,7 +59,7 @@ const backBadge = /** @type {HTMLSpanElement} */ (document.getElementById("backB
 const threadInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("threadInput"));
 const threadSend = /** @type {HTMLButtonElement} */ (document.getElementById("threadSend"));
 const threadReplyIndicator = /** @type {HTMLDivElement} */ (document.getElementById("threadReplyIndicator"));
-// threadReplyIndicatorText is wired in Task 6 when setThreadReplyTarget is added.
+const threadReplyIndicatorText = /** @type {HTMLSpanElement} */ (document.getElementById("threadReplyIndicatorText"));
 const threadReplyIndicatorClear = /** @type {HTMLButtonElement} */ (
   document.getElementById("threadReplyIndicatorClear")
 );
@@ -301,7 +301,7 @@ async function copyText(text) {
 
 // Build one chat bubble element. `withChip` adds a thread chip to a root that has replies; `inThread`
 // renders without a Reply affordance (the thread composer is the reply path) and pins the root.
-function buildBubble(message, { chip = null, isRoot = false } = {}) {
+function buildBubble(message, { chip = null, isRoot = false, reply = false } = {}) {
   const el = document.createElement("div");
   el.className = "bubble " + message.role + (isRoot ? " thread-root" : "");
   if (message.id) el.dataset.messageId = String(message.id);
@@ -315,9 +315,17 @@ function buildBubble(message, { chip = null, isRoot = false } = {}) {
       escapeHtml(chip) +
       "</button>";
   }
+  if (reply && message.id) {
+    html +=
+      '<button class="reply-button" type="button" data-reply-id="' +
+      escapeHtml(String(message.id)) +
+      '">Reply</button>';
+  }
   el.innerHTML = html;
   const chipButton = el.querySelector(".thread-chip");
   if (chipButton) chipButton.addEventListener("click", () => openThread(String(message.id)));
+  const replyButton = el.querySelector(".reply-button");
+  if (replyButton) replyButton.addEventListener("click", () => setThreadReplyTarget(String(message.id), message.text));
   return el;
 }
 
@@ -393,8 +401,8 @@ function renderThread(rootId) {
   threadTitle.textContent = replies.length
     ? threadChipLabel(replies.length, replies[replies.length - 1].at, Date.now())
     : "Thread";
-  threadChat.appendChild(buildBubble(root, { isRoot: true }));
-  for (const reply of replies) threadChat.appendChild(buildBubble(reply));
+  threadChat.appendChild(buildBubble(root, { isRoot: true, reply: true }));
+  for (const reply of replies) threadChat.appendChild(buildBubble(reply, { reply: true }));
   threadChat.scrollTop = threadChat.scrollHeight;
 }
 
@@ -434,6 +442,23 @@ function syncChat(chat) {
 function clearThreadReplyTarget() {
   threadReplyToId = "";
   if (threadReplyIndicator) threadReplyIndicator.hidden = true;
+}
+
+// Collapse whitespace and truncate long text for the reply indicator quote label.
+function truncateQuote(text) {
+  const flat = String(text).replace(/\s+/g, " ").trim();
+  return flat.length > 120 ? flat.slice(0, 120) + "…" : flat;
+}
+
+// Point the thread composer at a specific message. Shows the reply indicator so the user sees
+// what they are replying to, then focuses the thread input.
+function setThreadReplyTarget(id, text) {
+  threadReplyToId = String(id);
+  if (threadReplyIndicator) {
+    if (threadReplyIndicatorText) threadReplyIndicatorText.textContent = truncateQuote(text);
+    threadReplyIndicator.hidden = false;
+  }
+  if (threadInput) threadInput.focus();
 }
 
 function setAgentPresence(state) {
@@ -912,4 +937,5 @@ if (globalThis.__lavishTest) {
     shouldFlagBackBadge,
   };
   globalThis.__lavishTest.openThread = openThread;
+  globalThis.__lavishTest.setThreadReplyTarget = setThreadReplyTarget;
 }

@@ -149,3 +149,46 @@ test("incoming activity outside the open thread flags the Back badge", async () 
   });
   assert.equal(chrome.element("backBadge").hidden, false);
 });
+
+test("thread reply targets a specific sub-message when set", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: JSON.parse(init.body) });
+      return { ok: true };
+    },
+  });
+
+  // Seed a root + a sub-reply via the transcript.
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [
+        { id: "root1", role: "agent", text: "Root message", at: 1 },
+        { id: "r2", role: "agent", text: "the reply text", reply_to: "root1", at: 2 },
+      ],
+    }),
+  });
+  chrome.threadingOpen("root1");
+  // Target the sub-reply instead of the root.
+  chrome.threadingReplyTo("r2", "the reply text");
+  chrome.element("threadInput").value = "answering r2";
+  chrome.element("threadSend").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  const replyPost = posts.find((p) => p.url === "/api/abc/prompts");
+  assert.ok(replyPost, "a prompts POST was made");
+  assert.equal(replyPost.body.prompts[0].reply_to, "r2", "reply_to should target the sub-reply, not the root");
+});
+
+test("opening a thread clears any prior reply target", async () => {
+  const chrome = await createChromeHarness();
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root", at: 1 }] }),
+  });
+  chrome.threadingOpen("root1");
+  // Set a reply target then re-open the thread — it should be cleared.
+  chrome.threadingReplyTo("root1", "Root");
+  chrome.threadingOpen("root1");
+  assert.equal(chrome.element("threadReplyIndicator").hidden, true);
+});
