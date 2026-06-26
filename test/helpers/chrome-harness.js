@@ -78,6 +78,7 @@ export async function createChromeHarness({
     if (elements.has(id)) return elements.get(id);
     const listeners = new Map();
     const classes = new Set();
+    const children = [];
     const el = {
       id,
       hidden: false,
@@ -88,6 +89,7 @@ export async function createChromeHarness({
       scrollTop: 0,
       scrollHeight: 0,
       dataset: {},
+      children,
       classList: {
         add(...names) {
           for (const name of names) classes.add(name);
@@ -118,18 +120,45 @@ export async function createChromeHarness({
       querySelector() {
         return null;
       },
-      querySelectorAll() {
+      // Supports the single compound selector renderChat uses to clear old bubbles:
+      // ".bubble.user,.bubble.agent:not(.agent-working)"
+      querySelectorAll(selector) {
+        if (selector === ".bubble.user,.bubble.agent:not(.agent-working)") {
+          return children.filter((child) => {
+            const cn = String(child.className || "");
+            if (!cn.includes("bubble")) return false;
+            if (cn.includes("user")) return true;
+            return cn.includes("agent") && !cn.includes("agent-working");
+          });
+        }
         return [];
       },
       appendChild(child) {
         child.parentElement = this;
+        children.push(child);
         return child;
       },
-      insertBefore(child) {
+      insertBefore(child, ref) {
         child.parentElement = this;
+        if (ref) {
+          const idx = children.indexOf(ref);
+          if (idx !== -1) {
+            children.splice(idx, 0, child);
+          } else {
+            children.push(child);
+          }
+        } else {
+          children.push(child);
+        }
         return child;
       },
-      remove() {},
+      remove() {
+        const parent = this.parentElement;
+        if (parent && parent.children) {
+          const idx = parent.children.indexOf(this);
+          if (idx !== -1) parent.children.splice(idx, 1);
+        }
+      },
       focus() {
         this.focused = true;
       },
@@ -253,6 +282,13 @@ export async function createChromeHarness({
     },
     threadingUnread(rootId) {
       return context.__lavishTest.threadUnreadCount(rootId);
+    },
+    // Returns the joined innerHTML of every direct child of #chatLog, so tests
+    // can assert on rendered chip markup (e.g. /thread-chip unread/).
+    chatLogHtml() {
+      return element("chatLog")
+        .children.map((c) => c.innerHTML || "")
+        .join("");
     },
   };
 }

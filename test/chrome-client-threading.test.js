@@ -372,6 +372,63 @@ test("a read chip has no unread class and keeps the replies label", async () => 
   assert.match(el.innerHTML, /3 replies · 5m/);
 });
 
+// ── DOM-render order tests ──────────────────────────────────────────────────
+// These assert on the rendered #chatLog HTML, not just the read-model, so they
+// catch the class of bug where seenReplyCount is mutated AFTER renderChat().
+
+test("on load, existing threads render as READ (no unread chip)", async () => {
+  const chrome = await createChromeHarness();
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [
+        { id: "root1", role: "agent", text: "Root", at: 1 },
+        { id: "r1", role: "agent", text: "first reply", reply_to: "root1", at: 2 },
+      ],
+    }),
+  });
+  assert.doesNotMatch(chrome.chatLogHtml(), /thread-chip unread/);
+  assert.match(chrome.chatLogHtml(), /1 reply|replies/);
+});
+
+test("a reply into a CLOSED thread renders the chip unread", async () => {
+  const chrome = await createChromeHarness();
+  // Load baseline: root + one existing reply (both become read).
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [
+        { id: "root1", role: "agent", text: "Root", at: 1 },
+        { id: "r1", role: "agent", text: "first reply", reply_to: "root1", at: 2 },
+      ],
+    }),
+  });
+  // A second reply arrives while no thread is open → must show as unread.
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ id: "r2", role: "agent", text: "new reply", reply_to: "root1", at: 3 }),
+  });
+  assert.match(chrome.chatLogHtml(), /thread-chip unread/);
+  assert.match(chrome.chatLogHtml(), /1 new/);
+});
+
+test("a reply into the OPEN thread does NOT render the chip unread", async () => {
+  const chrome = await createChromeHarness();
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [
+        { id: "root1", role: "agent", text: "Root", at: 1 },
+        { id: "r1", role: "agent", text: "first reply", reply_to: "root1", at: 2 },
+      ],
+    }),
+  });
+  chrome.threadingOpen("root1");
+  // A new reply arrives into the thread that is currently open → chip stays read.
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ id: "r2", role: "agent", text: "in-thread", reply_to: "root1", at: 3 }),
+  });
+  assert.doesNotMatch(chrome.chatLogHtml(), /thread-chip unread/);
+});
+
+// ── end DOM-render order tests ──────────────────────────────────────────────
+
 test("setThreadReplyTarget ignores a local id and post uses the open root id", async () => {
   const posts = [];
   const chrome = await createChromeHarness({

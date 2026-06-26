@@ -505,8 +505,9 @@ function closeThread() {
 // Re-render the list and, if a thread is open, the thread view, from the current model.
 function syncChat(chat) {
   setMessages(chat);
-  renderChat();
+  // baseline BEFORE renderChat so chips paint with correct read-state on load
   baselineSeenOnce();
+  renderChat();
   if (workingBubble) chatLog.appendChild(workingBubble);
   if (openThreadRootId) {
     if (messagesById.has(openThreadRootId)) renderThread(openThreadRootId);
@@ -659,10 +660,11 @@ function sendThreadReply() {
   const localMsg = { id: "local-" + ++localMessageSeq, role: "user", text, at: Date.now() };
   if (safeReplyTo) localMsg.reply_to = safeReplyTo;
   rememberMessage(localMsg);
+  // Mark the open thread seen BEFORE renderChat so the chip paints as read.
+  markThreadSeen(openThreadRootId);
   renderChat();
   if (workingBubble) chatLog.appendChild(workingBubble);
   renderThread(openThreadRootId);
-  markThreadSeen(openThreadRootId);
   threadInput.value = "";
   clearThreadReplyTarget();
   render();
@@ -985,11 +987,17 @@ function ingestIncoming(message) {
   const lookahead = message.id != null ? new Map([...messagesById, [String(message.id), message]]) : messagesById;
   const flagBadge = shouldFlagBackBadge(openThreadRootId, message, lookahead) || flagsNewRoot(message);
   rememberMessage(message);
+  // Startup-race guard: if the initial sync was empty and content arrives live,
+  // lock seenBaselined so a later non-empty chat-sync baseline cannot erase the
+  // unread signal on a reply the user never opened.
+  if (!seenBaselined) seenBaselined = true;
+  // Mark the open thread seen BEFORE renderChat so the chip paints as read.
+  // A reply into a closed thread must still paint unread — only the open root is marked.
+  if (openThreadRootId) markThreadSeen(openThreadRootId);
   renderChat();
   if (workingBubble) chatLog.appendChild(workingBubble);
   if (openThreadRootId) {
     renderThread(openThreadRootId);
-    markThreadSeen(openThreadRootId);
     if (flagBadge) setBackBadge(true);
   }
 }
