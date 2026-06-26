@@ -24,7 +24,7 @@
 Spec: `docs/superpowers/specs/2026-06-26-annotation-actions-design.md`.
 Today the card row is `[Cancel] [Queue]` (the `.lavish-send` button is labelled "Queue" and only queues); send-now is hidden behind ⌘/Ctrl+Enter. This adds an explicit **Send** button and makes Cancel a ghost on the left.
 
-### Task A1: Three-action annotation card
+### Task 1: Three-action annotation card
 
 **Files:**
 - Modify: `src/artifact-sdk.js` — the shadow style string in `ensureShadow()` (~line 650), the card markup in `showAnnotationCard()` (~line 693), and the button wiring (~lines 701–720).
@@ -144,7 +144,7 @@ git commit -m "feat(annotate): explicit Cancel / Queue / Send actions on the ann
 Spec: `docs/superpowers/specs/2026-06-26-unread-thread-replies-design.md`.
 A session-only read model marks thread chips that have replies you haven't opened since they arrived; unread chips render solid brass + dot + "N new".
 
-### Task B1: Read model + pure helpers (fully unit-tested)
+### Task 2: Read model + pure helpers (fully unit-tested)
 
 **Files:**
 - Modify: `src/chrome-client.js` — add state + helpers near the other threading helpers and state; wire baseline into `syncChat`, mark-seen into `openThread` and the open-thread live-append paths; extend the `globalThis.__lavishTest` seam.
@@ -325,7 +325,7 @@ git add src/chrome-client.js test/chrome-client-threading.test.js test/helpers/c
 git commit -m "feat(ui): session-only unread read-model for threads (baseline, mark-seen, helpers)"
 ```
 
-### Task B2: Unread chip rendering + style
+### Task 3: Unread chip rendering + style
 
 **Files:**
 - Modify: `src/chrome-client.js` — `buildBubble` (chip markup) and `renderChat` (compute unread + label).
@@ -333,7 +333,7 @@ git commit -m "feat(ui): session-only unread read-model for threads (baseline, m
 - Modify: `test/chrome-client-threading.test.js` — chip-markup unit tests.
 
 **Interfaces:**
-- Consumes: `threadUnreadCount` (Task B1), `threadChipLabel`.
+- Consumes: `threadUnreadCount` (Task 2), `threadChipLabel`.
 - Produces: an unread chip — `class="thread-chip unread"`, a `<span class="dot"></span>`, label "N new".
 
 - [ ] **Step 1: Write failing chip-markup tests**
@@ -487,9 +487,9 @@ Only after Gates 1–2 pass and `npm run check` is green: `git push fork feat/re
 ## Self-Review
 
 **Spec coverage:**
-- Annotation spec → Task A1 (markup, wiring, styles, keyboard) + Gate 2 (E2E behavior). ✅
-- Unread read model (baseline, mark-seen, session-only, helpers) → Task B1. ✅
-- Unread chip (solid brass + dot + "N new"; read = muted "N replies · time") → Task B2. ✅
+- Annotation spec → Task 1 (markup, wiring, styles, keyboard) + Gate 2 (E2E behavior). ✅
+- Unread read model (baseline, mark-seen, session-only, helpers) → Task 2. ✅
+- Unread chip (solid brass + dot + "N new"; read = muted "N replies · time") → Task 3. ✅
 - Both: server untouched, Back badge untouched → no task modifies `server.js` or the badge logic. ✅
 - Testing (pure helpers + E2E for unread; E2E for annotation) → Task B1/B2 unit tests + Gate 2. ✅
 - Convergence before push → Gate 1. ✅
