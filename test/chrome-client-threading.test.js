@@ -429,6 +429,35 @@ test("a reply into the OPEN thread does NOT render the chip unread", async () =>
 
 // ── end DOM-render order tests ──────────────────────────────────────────────
 
+test("opening an unread thread repaints its chip as read in the list", async () => {
+  const chrome = await createChromeHarness();
+  const sync = chrome.eventSource().listeners.get("chat-sync");
+
+  // Baseline load: root + one existing reply (both become read at load).
+  sync({
+    data: JSON.stringify({
+      chat: [
+        { id: "root1", role: "agent", text: "Root", at: 1 },
+        { id: "r1", role: "agent", text: "first reply", reply_to: "root1", at: 2 },
+      ],
+    }),
+  });
+
+  // A new reply arrives while no thread is open → chip becomes unread.
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ id: "r2", role: "agent", text: "new reply", reply_to: "root1", at: 3 }),
+  });
+
+  // Precondition: chip is unread before opening.
+  assert.match(chrome.chatLogHtml(), /thread-chip unread/, "precondition: chip is unread before opening");
+
+  // Open the thread — marks it seen AND must repaint the list immediately.
+  chrome.threadingOpen("root1");
+
+  // Chip should now be read in the rendered list (no re-render event needed).
+  assert.doesNotMatch(chrome.chatLogHtml(), /thread-chip unread/, "chip should be read after opening the thread");
+});
+
 test("setThreadReplyTarget ignores a local id and post uses the open root id", async () => {
   const posts = [];
   const chrome = await createChromeHarness({

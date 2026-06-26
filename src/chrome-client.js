@@ -489,6 +489,7 @@ function setBackBadge(visible) {
 function openThread(rootId) {
   openThreadRootId = String(rootId);
   markThreadSeen(openThreadRootId);
+  renderChat();
   clearThreadReplyTarget();
   renderThread(openThreadRootId);
   setBackBadge(false);
