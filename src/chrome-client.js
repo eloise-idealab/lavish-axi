@@ -329,9 +329,9 @@ async function copyText(text) {
 //   "target"— Reply button whose click calls setThreadReplyTarget (for thread bubbles)
 /**
  * @param {ChatMsg} message
- * @param {{ chip?: string|null, isRoot?: boolean, reply?: false|"open"|"target" }} [opts]
+ * @param {{ chip?: string|null, chipUnread?: boolean, isRoot?: boolean, reply?: false|"open"|"target" }} [opts]
  */
-function buildBubble(message, { chip = null, isRoot = false, reply = false } = {}) {
+function buildBubble(message, { chip = null, chipUnread = false, isRoot = false, reply = false } = {}) {
   const el = document.createElement("div");
   el.className = "bubble " + message.role + (isRoot ? " thread-root" : "");
   if (message.id) el.dataset.messageId = String(message.id);
@@ -339,9 +339,11 @@ function buildBubble(message, { chip = null, isRoot = false, reply = false } = {
   let html = "<small>" + (message.role === "agent" ? "Agent" : "You") + "</small><div>" + body + "</div>";
   if (chip) {
     html +=
-      '<button class="thread-chip" type="button" data-root-id="' +
+      '<button class="thread-chip' +
+      (chipUnread ? " unread" : "") +
+      '" type="button" data-root-id="' +
       escapeHtml(String(message.id)) +
-      '">' +
+      '"><span class="dot"></span>' +
       escapeHtml(chip) +
       "</button>";
   }
@@ -417,16 +419,20 @@ function renderChat() {
   for (const root of roots) {
     const id = root.id != null ? String(root.id) : "";
     const replies = id ? repliesByRoot.get(id) || [] : [];
-    let chip = null;
     /** @type {false|"open"|"target"} */
-    let reply = false;
+    const reply = replies.length ? false : isLocalId(id) ? false : "open";
+    let chip = null;
+    let chipUnread = false;
     if (replies.length) {
-      const lastAt = replies[replies.length - 1].at;
-      chip = threadChipLabel(replies.length, lastAt, now);
-    } else {
-      reply = "open";
+      const unread = unreadReplyCount(id, replies.length, seenReplyCount);
+      if (unread > 0) {
+        chipUnread = true;
+        chip = unread === 1 ? "1 new" : unread + " new";
+      } else {
+        chip = threadChipLabel(replies.length, replies[replies.length - 1].at, now);
+      }
     }
-    chatLog.insertBefore(buildBubble(root, { chip, reply }), reference);
+    chatLog.insertBefore(buildBubble(root, { chip, chipUnread, reply }), reference);
   }
   chatLog.scrollTop = chatLog.scrollHeight;
 }

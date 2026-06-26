@@ -351,6 +351,27 @@ test("a reply into the currently open thread does not become unread", async () =
   assert.equal(chrome.threadingUnread("root1"), 0);
 });
 
+test("an unread chip renders the unread class, a dot, and an 'N new' label", async () => {
+  const chrome = await createChromeHarness();
+  const el = chrome.threadingBuildBubble(
+    { id: "root1", role: "agent", text: "Root" },
+    { chip: "2 new", chipUnread: true },
+  );
+  assert.match(el.innerHTML, /thread-chip unread/);
+  assert.match(el.innerHTML, /class="dot"/);
+  assert.match(el.innerHTML, /2 new/);
+});
+
+test("a read chip has no unread class and keeps the replies label", async () => {
+  const chrome = await createChromeHarness();
+  const el = chrome.threadingBuildBubble(
+    { id: "root1", role: "agent", text: "Root" },
+    { chip: "3 replies · 5m", chipUnread: false },
+  );
+  assert.doesNotMatch(el.innerHTML, /thread-chip unread/);
+  assert.match(el.innerHTML, /3 replies · 5m/);
+});
+
 test("setThreadReplyTarget ignores a local id and post uses the open root id", async () => {
   const posts = [];
   const chrome = await createChromeHarness({

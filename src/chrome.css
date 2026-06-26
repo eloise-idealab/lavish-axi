@@ -933,3 +933,19 @@ body.layout-gate-active iframe#artifact {
 .thread-chip:hover {
   background: rgba(244, 201, 93, 0.18);
 }
+.thread-chip .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  display: none;
+}
+.thread-chip.unread {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--brass-ink);
+}
+.thread-chip.unread .dot {
+  display: block;
+  background: var(--brass-ink);
+}
