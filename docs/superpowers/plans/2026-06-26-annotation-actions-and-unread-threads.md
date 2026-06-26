@@ -27,9 +27,11 @@ Today the card row is `[Cancel] [Queue]` (the `.lavish-send` button is labelled 
 ### Task 1: Three-action annotation card
 
 **Files:**
+
 - Modify: `src/artifact-sdk.js` — the shadow style string in `ensureShadow()` (~line 650), the card markup in `showAnnotationCard()` (~line 693), and the button wiring (~lines 701–720).
 
 **Interfaces:**
+
 - Consumes: existing `queuePrompt(prompt, opts)`, `sendQueuedPrompts()`, `closeCard()` (all already defined inside `createArtifactSdk`).
 - Produces: a card whose row is Cancel (ghost) · spacer · Queue (steel) · Send (brass), wired so Cancel discards, Queue queues, Send queues+sends.
 
@@ -38,19 +40,25 @@ Today the card row is `[Cancel] [Queue]` (the `.lavish-send` button is labelled 
 In the long `style.textContent` string inside `ensureShadow()`, make these two exact replacements:
 
 Replace:
+
 ```
 .lavish-annotation-card .lavish-row{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
 ```
+
 with:
+
 ```
 .lavish-annotation-card .lavish-row{display:flex;gap:8px;align-items:center;margin-top:8px}.lavish-annotation-card .lavish-spacer{flex:1}
 ```
 
 Replace:
+
 ```
 .lavish-annotation-card .lavish-cancel{background:var(--steel-700);color:var(--fg)}
 ```
+
 with:
+
 ```
 .lavish-annotation-card .lavish-queue{background:var(--steel-700);color:var(--fg)}.lavish-annotation-card .lavish-queue:hover{background:var(--steel-600)}.lavish-annotation-card .lavish-cancel{background:transparent;color:var(--fg-faint)}.lavish-annotation-card .lavish-cancel:hover{color:var(--fg)}
 ```
@@ -60,10 +68,13 @@ with:
 - [ ] **Step 2: Update the card row markup**
 
 In `showAnnotationCard`, replace the row substring:
+
 ```
 '</div><div class="lavish-row"><button class="lavish-cancel" type="button">Cancel</button><button class="lavish-send" type="button">Queue</button></div>';
 ```
+
 with:
+
 ```
 '</div><div class="lavish-row"><button class="lavish-cancel" type="button">Cancel</button><span class="lavish-spacer"></span><button class="lavish-queue" type="button">Queue</button><button class="lavish-send" type="button">Send</button></div>';
 ```
@@ -71,6 +82,7 @@ with:
 - [ ] **Step 3: Rewire the buttons + keyboard**
 
 Replace the wiring block:
+
 ```
     const textarea = /** @type {HTMLTextAreaElement | null} */ (card.querySelector("textarea"));
     const cancelButton = /** @type {HTMLButtonElement | null} */ (card.querySelector(".lavish-cancel"));
@@ -93,7 +105,9 @@ Replace the wiring block:
       }
     });
 ```
+
 with:
+
 ```
     const textarea = /** @type {HTMLTextAreaElement | null} */ (card.querySelector("textarea"));
     const cancelButton = /** @type {HTMLButtonElement | null} */ (card.querySelector(".lavish-cancel"));
@@ -147,11 +161,13 @@ A session-only read model marks thread chips that have replies you haven't opene
 ### Task 2: Read model + pure helpers (fully unit-tested)
 
 **Files:**
+
 - Modify: `src/chrome-client.js` — add state + helpers near the other threading helpers and state; wire baseline into `syncChat`, mark-seen into `openThread` and the open-thread live-append paths; extend the `globalThis.__lavishTest` seam.
 - Modify: `test/chrome-client-threading.test.js` — unit tests.
 - Modify: `test/helpers/chrome-harness.js` — expose the new seam query.
 
 **Interfaces:**
+
 - Produces (defined in `chrome-client.js`):
   - `unreadReplyCount(rootId: string, currentCount: number, seenMap: Map<string,number>): number` — `max(0, currentCount - (seenMap.get(rootId) ?? 0))`.
   - `isThreadUnread(rootId, currentCount, seenMap): boolean` — `unreadReplyCount(...) > 0`.
@@ -220,6 +236,7 @@ Expected: FAIL — `chrome.threadingUnread` / `unreadReplyCount` undefined.
 - [ ] **Step 3: Add state + helpers**
 
 Near the threading state block (after `let openThreadRootId = "";`), add:
+
 ```js
 /** @type {Map<string, number>} */
 const seenReplyCount = new Map();
@@ -227,6 +244,7 @@ let seenBaselined = false;
 ```
 
 Near the other pure helpers (after `shouldFlagBackBadge`), add:
+
 ```js
 // How many replies in a thread the user has not seen yet (never negative).
 /** @param {string} rootId @param {number} currentCount @param {Map<string, number>} seenMap @returns {number} */
@@ -242,6 +260,7 @@ function isThreadUnread(rootId, currentCount, seenMap) {
 ```
 
 After `renderThread` (or near `openThread`), add the model-aware helpers:
+
 ```js
 // Current reply count for one root, from the live model.
 function replyCountForRoot(rootId) {
@@ -272,39 +291,47 @@ function baselineSeenOnce() {
 - [ ] **Step 4: Wire baseline + mark-seen into the lifecycle**
 
 In `syncChat`, after `setMessages(chat); renderChat();` and before the open-thread re-render, add the baseline call:
+
 ```js
-  baselineSeenOnce();
+baselineSeenOnce();
 ```
+
 (Order: `setMessages` populates the model first, so `baselineSeenOnce` counts real replies; it runs once.)
 
 In `openThread`, after `openThreadRootId = String(rootId);`, add:
+
 ```js
-  markThreadSeen(openThreadRootId);
+markThreadSeen(openThreadRootId);
 ```
 
 In `ingestIncoming`, after `rememberMessage(message);` and inside the `if (openThreadRootId)` block where the open thread is re-rendered, mark the open thread seen so a live reply into it never shows unread:
+
 ```js
-  if (openThreadRootId) {
-    renderThread(openThreadRootId);
-    markThreadSeen(openThreadRootId);
-    if (flagBadge) setBackBadge(true);
-  }
+if (openThreadRootId) {
+  renderThread(openThreadRootId);
+  markThreadSeen(openThreadRootId);
+  if (flagBadge) setBackBadge(true);
+}
 ```
 
 In `sendThreadReply`, after `renderThread(openThreadRootId);`, add:
+
 ```js
-  markThreadSeen(openThreadRootId);
+markThreadSeen(openThreadRootId);
 ```
 
 - [ ] **Step 5: Expose on the seam + harness**
 
 In the `globalThis.__lavishTest` block, add:
+
 ```js
-  globalThis.__lavishTest.unreadReplyCount = unreadReplyCount;
-  globalThis.__lavishTest.isThreadUnread = isThreadUnread;
-  globalThis.__lavishTest.threadUnreadCount = threadUnreadCount;
+globalThis.__lavishTest.unreadReplyCount = unreadReplyCount;
+globalThis.__lavishTest.isThreadUnread = isThreadUnread;
+globalThis.__lavishTest.threadUnreadCount = threadUnreadCount;
 ```
+
 Update the `threading()` seam object to also include `unreadReplyCount` and `isThreadUnread` (so `const { unreadReplyCount } = await threading()` works), and in `test/helpers/chrome-harness.js` add to the returned object:
+
 ```js
     threadingUnread(rootId) {
       return context.__lavishTest.threadUnreadCount(rootId);
@@ -328,11 +355,13 @@ git commit -m "feat(ui): session-only unread read-model for threads (baseline, m
 ### Task 3: Unread chip rendering + style
 
 **Files:**
+
 - Modify: `src/chrome-client.js` — `buildBubble` (chip markup) and `renderChat` (compute unread + label).
 - Modify: `src/chrome.css` — `.thread-chip .dot` and `.thread-chip.unread`.
 - Modify: `test/chrome-client-threading.test.js` — chip-markup unit tests.
 
 **Interfaces:**
+
 - Consumes: `threadUnreadCount` (Task 2), `threadChipLabel`.
 - Produces: an unread chip — `class="thread-chip unread"`, a `<span class="dot"></span>`, label "N new".
 
@@ -371,69 +400,81 @@ Expected: FAIL — `buildBubble` ignores `chipUnread`; no `.dot` span.
 - [ ] **Step 3: Update `buildBubble` chip markup**
 
 In `buildBubble`, change the signature to accept `chipUnread` and rebuild the chip markup. Replace:
+
 ```js
 function buildBubble(message, { chip = null, isRoot = false, reply = false } = {}) {
 ```
+
 with:
+
 ```js
 function buildBubble(message, { chip = null, chipUnread = false, isRoot = false, reply = false } = {}) {
 ```
+
 And replace the chip block:
+
 ```js
-  if (chip) {
-    html +=
-      '<button class="thread-chip" type="button" data-root-id="' +
-      escapeHtml(String(message.id)) +
-      '">' +
-      escapeHtml(chip) +
-      "</button>";
-  }
+if (chip) {
+  html +=
+    '<button class="thread-chip" type="button" data-root-id="' +
+    escapeHtml(String(message.id)) +
+    '">' +
+    escapeHtml(chip) +
+    "</button>";
+}
 ```
+
 with:
+
 ```js
-  if (chip) {
-    html +=
-      '<button class="thread-chip' +
-      (chipUnread ? " unread" : "") +
-      '" type="button" data-root-id="' +
-      escapeHtml(String(message.id)) +
-      '"><span class="dot"></span>' +
-      escapeHtml(chip) +
-      "</button>";
-  }
+if (chip) {
+  html +=
+    '<button class="thread-chip' +
+    (chipUnread ? " unread" : "") +
+    '" type="button" data-root-id="' +
+    escapeHtml(String(message.id)) +
+    '"><span class="dot"></span>' +
+    escapeHtml(chip) +
+    "</button>";
+}
 ```
 
 - [ ] **Step 4: Compute unread in `renderChat`**
 
 In `renderChat`, replace the chip computation:
+
 ```js
-    let chip = null;
-    if (replies.length) {
-      const lastAt = replies[replies.length - 1].at;
-      chip = threadChipLabel(replies.length, lastAt, now);
-    }
-    chatLog.insertBefore(buildBubble(root, { chip, reply }), reference);
+let chip = null;
+if (replies.length) {
+  const lastAt = replies[replies.length - 1].at;
+  chip = threadChipLabel(replies.length, lastAt, now);
+}
+chatLog.insertBefore(buildBubble(root, { chip, reply }), reference);
 ```
+
 with (note: `reply` is still computed as today — `replies.length ? false : (isLocalId(id) ? false : "open")`):
+
 ```js
-    let chip = null;
-    let chipUnread = false;
-    if (replies.length) {
-      const unread = unreadReplyCount(id, replies.length, seenReplyCount);
-      if (unread > 0) {
-        chipUnread = true;
-        chip = unread === 1 ? "1 new" : unread + " new";
-      } else {
-        chip = threadChipLabel(replies.length, replies[replies.length - 1].at, now);
-      }
-    }
-    chatLog.insertBefore(buildBubble(root, { chip, chipUnread, reply }), reference);
+let chip = null;
+let chipUnread = false;
+if (replies.length) {
+  const unread = unreadReplyCount(id, replies.length, seenReplyCount);
+  if (unread > 0) {
+    chipUnread = true;
+    chip = unread === 1 ? "1 new" : unread + " new";
+  } else {
+    chip = threadChipLabel(replies.length, replies[replies.length - 1].at, now);
+  }
+}
+chatLog.insertBefore(buildBubble(root, { chip, chipUnread, reply }), reference);
 ```
+
 (Keep the existing `const reply = ...` line above this block unchanged.)
 
 - [ ] **Step 5: Add the unread chip CSS**
 
 Append to the `.thread-chip` block area in `src/chrome.css`:
+
 ```css
 .thread-chip .dot {
   width: 6px;
@@ -473,13 +514,16 @@ git commit -m "feat(ui): unread thread chips — solid brass + dot + 'N new'"
 ## Gates (run by the controller after the tasks, before push)
 
 ### Gate 1: Codex ↔ Claude convergence
+
 Capture the combined diff for this branch's new work (`git diff <pre-feature-base>..HEAD -- src test`), run the Codex reviewer (`codex exec --sandbox read-only - < prompt.txt`, background, no `timeout`) and a blind Claude reviewer in parallel over both features. Verify each finding, fix test-first, repeat until BOTH agree there are no remaining BLOCKER/HIGH/MEDIUM issues. Watch especially for: escaping of the "N new"/chip text and the annotation card markup; the baseline-once flag not re-baselining on later syncs; mark-seen covering every read path (open, live-append, send); and Queue-vs-Send wiring (Queue must NOT send).
 
 ### Gate 2: Playwright E2E (real browser, out-of-repo harness)
+
 - **Annotation:** with Annotate mode on, click an element, type a note. Assert: **Queue** adds a pending pill and posts NO prompts; **Send** posts the prompts to `/api/:key/prompts` and clears the pill; **Cancel** removes the card with no pill and no request; the row shows Cancel left, Queue+Send right, no overflow.
 - **Unread:** seed a root + reply (read at load); post a new `agent-reply` into that thread while it's closed → assert its chip gains `.thread-chip.unread` and reads "1 new"; open the thread → assert it reverts to muted "N replies · <time>".
 
 ### Gate 3: Push
+
 Only after Gates 1–2 pass and `npm run check` is green: `git push fork feat/realtime-sse-threading`. Report the pushed range and the PR-create URL.
 
 ---
@@ -487,6 +531,7 @@ Only after Gates 1–2 pass and `npm run check` is green: `git push fork feat/re
 ## Self-Review
 
 **Spec coverage:**
+
 - Annotation spec → Task 1 (markup, wiring, styles, keyboard) + Gate 2 (E2E behavior). ✅
 - Unread read model (baseline, mark-seen, session-only, helpers) → Task 2. ✅
 - Unread chip (solid brass + dot + "N new"; read = muted "N replies · time") → Task 3. ✅

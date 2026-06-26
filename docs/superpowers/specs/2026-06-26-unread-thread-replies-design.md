@@ -7,7 +7,7 @@ Status: approved (via mockup), pending spec review
 ## Context
 
 The thread panel groups replies under a root and shows a reply-count chip on roots with ≥1 reply ("3 replies · 5m").
-The only unread signal today is the transient **Back badge**, which lights only while you are reading a *different* thread (`shouldFlagBackBadge` + `setBackBadge`) and clears on `openThread`/`closeThread`.
+The only unread signal today is the transient **Back badge**, which lights only while you are reading a _different_ thread (`shouldFlagBackBadge` + `setBackBadge`) and clears on `openThread`/`closeThread`.
 In the root list there is no per-thread read/unread state: a chip looks identical whether or not the agent has posted new replies you haven't seen.
 So a reply that lands in a thread you're not currently viewing is easy to miss once you're back in the list.
 
@@ -22,7 +22,7 @@ Make it obvious, at a glance in the root list, which threads have replies you ha
 - Track `seenReplyCount: Map<rootId, number>` — how many replies in each thread the user has seen.
 - **Baseline once on first load:** the first `syncChat` (initial transcript) marks every thread as seen (`seenReplyCount[rootId] = current reply count`), so opening the review does NOT flag every existing thread as unread. A `seenBaselined` flag guards this so later syncs don't re-baseline.
 - **Becomes unread:** any later `syncChat` or `agent-reply` that grows a thread's reply count beyond its seen count makes it unread. `seenReplyCount` is preserved across model rebuilds (it is independent of the message model, which is cleared and rebuilt by `setMessages`).
-- **Marked read:** `openThread(rootId)` sets `seenReplyCount[rootId] = current reply count` for that root. A reply that arrives into the *currently open* thread (live append in `ingestIncoming`/`sendThreadReply` when `openThreadRootId === rootId`) also bumps the seen count, so you never see your own open thread as unread.
+- **Marked read:** `openThread(rootId)` sets `seenReplyCount[rootId] = current reply count` for that root. A reply that arrives into the _currently open_ thread (live append in `ingestIncoming`/`sendThreadReply` when `openThreadRootId === rootId`) also bumps the seen count, so you never see your own open thread as unread.
 - **Persistence:** in memory only. A page reload rebuilds the model and re-baselines, so everything is read again. (Approved YAGNI call — reloads are rare in a review session.)
 
 ### Unread count + chip
