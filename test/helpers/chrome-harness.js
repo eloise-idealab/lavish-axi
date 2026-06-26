@@ -251,6 +251,9 @@ export async function createChromeHarness({
     threadingOrdered() {
       return toHost(context.__lavishTest.orderedMessages());
     },
+    threadingUnread(rootId) {
+      return context.__lavishTest.threadUnreadCount(rootId);
+    },
   };
 }
 

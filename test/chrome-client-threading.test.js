@@ -305,6 +305,52 @@ test("a durable root still renders its reply affordance", async () => {
   assert.ok(el.innerHTML.includes('data-reply-id="root1"'), 'durable root should include data-reply-id="root1"');
 });
 
+test("unreadReplyCount is the count beyond seen, never negative", async () => {
+  const { unreadReplyCount } = await threading();
+  const seen = new Map([["a", 2]]);
+  assert.equal(unreadReplyCount("a", 3, seen), 1);
+  assert.equal(unreadReplyCount("a", 2, seen), 0);
+  assert.equal(unreadReplyCount("a", 1, seen), 0); // seen ahead of count → clamp 0
+  assert.equal(unreadReplyCount("b", 2, seen), 2); // unseen root → all unread
+});
+
+test("threads are read at load baseline, unread on a later reply, read again on open", async () => {
+  const chrome = await createChromeHarness();
+  const sync = chrome.eventSource().listeners.get("chat-sync");
+  // Baseline load: a root with one existing reply.
+  sync({
+    data: JSON.stringify({
+      chat: [
+        { id: "root1", role: "agent", text: "Root", at: 1 },
+        { id: "r1", role: "agent", text: "first reply", reply_to: "root1", at: 2 },
+      ],
+    }),
+  });
+  assert.equal(chrome.threadingUnread("root1"), 0); // existing replies are read at load
+
+  // A new reply arrives into the (closed) thread → unread.
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ id: "r2", role: "agent", text: "new reply", reply_to: "root1", at: 3 }),
+  });
+  assert.equal(chrome.threadingUnread("root1"), 1);
+
+  // Opening the thread marks it read.
+  chrome.threadingOpen("root1");
+  assert.equal(chrome.threadingUnread("root1"), 0);
+});
+
+test("a reply into the currently open thread does not become unread", async () => {
+  const chrome = await createChromeHarness();
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root", at: 1 }] }),
+  });
+  chrome.threadingOpen("root1");
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ id: "r1", role: "agent", text: "in-thread", reply_to: "root1", at: 2 }),
+  });
+  assert.equal(chrome.threadingUnread("root1"), 0);
+});
+
 test("setThreadReplyTarget ignores a local id and post uses the open root id", async () => {
   const posts = [];
   const chrome = await createChromeHarness({

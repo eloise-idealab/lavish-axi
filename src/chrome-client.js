@@ -50,6 +50,9 @@ const messagesById = new Map();
 /** @type {string[]} */
 const messageOrder = [];
 let openThreadRootId = "";
+/** @type {Map<string, number>} */
+const seenReplyCount = new Map();
+let seenBaselined = false;
 const chatPane = /** @type {HTMLDivElement} */ (document.getElementById("chatPane"));
 const panel = chatPane?.parentElement || null;
 const threadChat = /** @type {HTMLDivElement} */ (document.getElementById("threadChat"));
@@ -198,6 +201,18 @@ function shouldFlagBackBadge(openRootId, message, byId) {
   const id = message && message.id != null ? String(message.id) : "";
   if (!id) return false;
   return resolveRootId(id, byId) !== String(openRootId);
+}
+
+// How many replies in a thread the user has not seen yet (never negative).
+/** @param {string} rootId @param {number} currentCount @param {Map<string, number>} seenMap @returns {number} */
+function unreadReplyCount(rootId, currentCount, seenMap) {
+  const seen = seenMap.get(String(rootId)) || 0;
+  return Math.max(0, currentCount - seen);
+}
+
+/** @param {string} rootId @param {number} currentCount @param {Map<string, number>} seenMap @returns {boolean} */
+function isThreadUnread(rootId, currentCount, seenMap) {
+  return unreadReplyCount(rootId, currentCount, seenMap) > 0;
 }
 
 function loadQueuedPrompts() {
@@ -431,6 +446,34 @@ function renderThread(rootId) {
   threadChat.scrollTop = threadChat.scrollHeight;
 }
 
+// Current reply count for one root, from the live model.
+function replyCountForRoot(rootId) {
+  const { repliesByRoot } = groupThreads(orderedMessages());
+  return (repliesByRoot.get(String(rootId)) || []).length;
+}
+
+function threadUnreadCount(rootId) {
+  return unreadReplyCount(String(rootId), replyCountForRoot(rootId), seenReplyCount);
+}
+
+// Mark a thread read: the user has now seen all its current replies.
+function markThreadSeen(rootId) {
+  seenReplyCount.set(String(rootId), replyCountForRoot(rootId));
+}
+
+// On the first authoritative transcript with content, treat every existing thread as read.
+// Guard is deferred until the model is non-empty so that an initial empty sync doesn't
+// lock seenBaselined before real messages arrive.
+function baselineSeenOnce() {
+  if (seenBaselined) return;
+  const { roots } = groupThreads(orderedMessages());
+  if (!roots.length) return; // nothing to baseline yet — wait for the real transcript
+  seenBaselined = true;
+  for (const root of roots) {
+    if (root.id != null) markThreadSeen(String(root.id));
+  }
+}
+
 function setBackBadge(visible) {
   if (!backBadge) return;
   backBadge.hidden = !visible;
@@ -439,6 +482,7 @@ function setBackBadge(visible) {
 
 function openThread(rootId) {
   openThreadRootId = String(rootId);
+  markThreadSeen(openThreadRootId);
   clearThreadReplyTarget();
   renderThread(openThreadRootId);
   setBackBadge(false);
@@ -456,6 +500,7 @@ function closeThread() {
 function syncChat(chat) {
   setMessages(chat);
   renderChat();
+  baselineSeenOnce();
   if (workingBubble) chatLog.appendChild(workingBubble);
   if (openThreadRootId) {
     if (messagesById.has(openThreadRootId)) renderThread(openThreadRootId);
@@ -611,6 +656,7 @@ function sendThreadReply() {
   renderChat();
   if (workingBubble) chatLog.appendChild(workingBubble);
   renderThread(openThreadRootId);
+  markThreadSeen(openThreadRootId);
   threadInput.value = "";
   clearThreadReplyTarget();
   render();
@@ -937,6 +983,7 @@ function ingestIncoming(message) {
   if (workingBubble) chatLog.appendChild(workingBubble);
   if (openThreadRootId) {
     renderThread(openThreadRootId);
+    markThreadSeen(openThreadRootId);
     if (flagBadge) setBackBadge(true);
   }
 }
@@ -974,9 +1021,14 @@ if (globalThis.__lavishTest) {
     formatRelativeTime,
     threadChipLabel,
     shouldFlagBackBadge,
+    unreadReplyCount,
+    isThreadUnread,
   };
   globalThis.__lavishTest.openThread = openThread;
   globalThis.__lavishTest.setThreadReplyTarget = setThreadReplyTarget;
   globalThis.__lavishTest.buildBubble = buildBubble;
   globalThis.__lavishTest.orderedMessages = orderedMessages;
+  globalThis.__lavishTest.unreadReplyCount = unreadReplyCount;
+  globalThis.__lavishTest.isThreadUnread = isThreadUnread;
+  globalThis.__lavishTest.threadUnreadCount = threadUnreadCount;
 }
