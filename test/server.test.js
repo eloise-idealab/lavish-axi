@@ -1765,6 +1765,35 @@ test("layout gate curtain reuses the ended overlay card styling", async () => {
   assert.match(noGateHtml, /"layoutGateEnabled":false/);
 });
 
+test("layout gate overlay is scoped to the artifact frame so it never covers the chat composer", async () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const css = await chromeCssSource();
+
+  // The gate overlay must be nested INSIDE the artifact .frame, not a viewport-level sibling
+  // that sits on top of the side panel where the composer (Send / chat input) lives. Otherwise
+  // the curtain that flags a broken layout also blocks the human from telling the agent about it.
+  const frameStart = html.indexOf('<div class="frame">');
+  const panelStart = html.indexOf('<aside class="panel">');
+  assert.ok(frameStart !== -1 && panelStart !== -1 && frameStart < panelStart);
+  const frameRegion = html.slice(frameStart, panelStart);
+  assert.ok(
+    frameRegion.includes('id="layoutGateOverlay"'),
+    "layoutGateOverlay must be nested inside the artifact .frame",
+  );
+  // The composer controls live in the panel, never inside the frame region.
+  assert.ok(!frameRegion.includes('id="chatInput"'), "chatInput must stay outside the frame");
+  assert.ok(!frameRegion.includes('id="send"'), "send button must stay outside the frame");
+
+  // Frame scoping only holds if the overlay is positioned within the frame (absolute, inset:0),
+  // not pinned to the viewport (fixed) where it would re-cover the panel.
+  assert.match(css, /\.layout-gate-overlay\{[^}]*position:absolute/);
+  assert.match(css, /\.layout-gate-overlay\{[^}]*inset:0/);
+  // The frame is the positioning + clipping context that geometrically contains the absolute
+  // overlay, so the curtain can never spill onto the panel regardless of z-index or hit-testing.
+  assert.match(css, /\.frame\{[^}]*position:relative/);
+  assert.match(css, /\.frame\{[^}]*overflow:hidden/);
+});
+
 test("annotation card queues prompt on Enter and inserts newline on Shift+Enter", () => {
   const js = createSdkJs("abc");
 

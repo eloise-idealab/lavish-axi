@@ -759,6 +759,13 @@ body.lavish {
 .ended-overlay[hidden] {
   display: none;
 }
+.layout-gate-overlay {
+  /* Scope the layout-check curtain to the artifact frame (.frame is position:relative;
+     overflow:hidden) so it hides only the unverified artifact, never the chat composer
+     in the side panel. The human must always be able to message the agent. */
+  position: absolute;
+  inset: 0;
+}
 .ended-card {
   width: min(360px, calc(100vw - 48px));
   border: 1px solid var(--border);
