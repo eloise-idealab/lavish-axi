@@ -243,6 +243,15 @@ export async function serve({
     // Held outside the try so a synchronous throw after we register the stream still runs cleanup
     // (otherwise the slot/listeners/presence would leak for the process lifetime).
     let cleanup = null;
+    let closed = false;
+    // Track disconnect BEFORE the first await: a close during canonicalFile/findByKey would
+    // otherwise be missed (cleanup registered too late) and leak the stream slot plus presence/idle
+    // state. cleanup is null until the stream is set up; the post-await guard handles a close that
+    // lands before then.
+    req.on("close", () => {
+      closed = true;
+      if (cleanup) cleanup();
+    });
     try {
       const file = await canonicalFile(String(req.query.file || ""));
       const key = sessionKey(file);
@@ -250,6 +259,11 @@ export async function serve({
       const session = await store.findByKey(key);
       if (!session) {
         res.status(404).json({ status: "missing" });
+        return;
+      }
+      // The client may have disconnected during the awaits above; nothing is registered yet, so bail
+      // before claiming the slot or marking presence.
+      if (closed || req.destroyed) {
         return;
       }
       // Bound concurrent streams so a flood of connections can't exhaust sockets/listeners. The
@@ -260,8 +274,6 @@ export async function serve({
         return;
       }
       streamClients.add(res);
-      // Tracks client disconnect so the drain never clears a batch it couldn't deliver.
-      let closed = false;
       let heartbeat = null;
       let cleanedUp = false;
       // Set once this stream is finished delivering (a --once single message, or a detected
@@ -382,9 +394,6 @@ export async function serve({
         setPollActive(key, activePolls, deliveredFeedback, events, false);
         refreshIdleTimer();
       };
-      // Register cleanup before anything that can throw, so an early failure can't leak the slot.
-      req.on("close", cleanup);
-
       res.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
@@ -544,7 +553,22 @@ export async function serve({
       });
       sseClients.add(res);
       refreshIdleTimer();
+      let cleanup = null;
+      // Capture a disconnect that lands during the findByKey await below, before the per-listener
+      // cleanup is wired up; otherwise the sseClients slot (and its listeners) leak and keep
+      // sseClients.size > 0, blocking idle shutdown. Until cleanup exists, free the slot we already
+      // claimed; once it exists, run it.
+      let closed = false;
+      req.on("close", () => {
+        closed = true;
+        if (cleanup) cleanup();
+        else {
+          sseClients.delete(res);
+          refreshIdleTimer();
+        }
+      });
       const session = await store.findByKey(req.params.key);
+      if (closed) return;
       const sendReload = (key) => {
         if (key === req.params.key) {
           res.write("event: reload\ndata: {}\n\n");
@@ -578,14 +602,14 @@ export async function serve({
       events.on("agent-reply", sendAgentReply);
       events.on("agent-presence", sendPresence);
       events.on("chat-changed", sendChatSync);
-      req.on("close", () => {
+      cleanup = () => {
         sseClients.delete(res);
         events.off("reload", sendReload);
         events.off("agent-reply", sendAgentReply);
         events.off("agent-presence", sendPresence);
         events.off("chat-changed", sendChatSync);
         refreshIdleTimer();
-      });
+      };
     } catch (error) {
       next(error);
     }

@@ -1103,6 +1103,51 @@ test("an open SSE connection keeps the server alive past the idle timeout", asyn
   }
 });
 
+test("an /events SSE that disconnects during its setup await frees its slot and lets the server idle-shut-down (pre-await leak regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-events-preawait-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const stateFile = path.join(dir, "state.json");
+  const server = await serve({
+    port: 0,
+    stateFile,
+    version: "9.9.9-test",
+    idleTimeoutMs: 1000,
+  });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+
+    // Bloat state.json so the handler's findByKey await is wide enough to disconnect inside it.
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    state.sessions[key].chat = Array.from({ length: 120000 }, (_, i) => ({
+      id: `m${i}`,
+      role: "agent",
+      text: `padding message ${i} that widens the state parse window for this regression test`,
+      ts: i,
+    }));
+    await writeFile(stateFile, JSON.stringify(state));
+
+    // Open the chrome SSE and drop it while its findByKey await is still in flight. The buggy path
+    // registered req.on("close") only after that await, so the sseClients slot and its listeners
+    // leaked and pinned the server alive forever (sseClients.size never returns to 0).
+    const sse = fetch(`${base}/events/${key}`, { signal: controller.signal }).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+    await sse;
+
+    // A leaked sseClients entry keeps sseClients.size > 0, so the idle timer can never arm; the fix
+    // frees the slot on the early disconnect so the server idles down as expected.
+    await expectDoneWithin(server, 4000);
+    await assert.rejects(() => fetch(`${base}/health`), /fetch failed|ECONNREFUSED/);
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("ending the last open session shuts the server down", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
@@ -1985,6 +2030,75 @@ test("GET /api/stream caps concurrent connections and frees the slot on disconne
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.ok(admitted, "a slot frees up after a stream disconnects");
+  } finally {
+    for (const controller of controllers) controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stream that disconnects during its setup awaits frees its slot (pre-await leak regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-preawait-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const stateFile = path.join(dir, "state.json");
+  const server = await serve({
+    port: 0,
+    stateFile,
+    version: "9.9.9-test",
+    maxStreamClients: 1,
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const controllers = [];
+  const openStream = () => {
+    const controller = new AbortController();
+    controllers.push(controller);
+    return fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+  };
+  try {
+    const { key } = await openSession(base, artifact);
+
+    // Bloat state.json so every store read (findByKey) parses a large payload, holding the stream
+    // handler inside its initial awaits long enough for a disconnect to land there.
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    state.sessions[key].chat = Array.from({ length: 120000 }, (_, i) => ({
+      id: `m${i}`,
+      role: "agent",
+      text: `padding message ${i} that widens the state parse window for this regression test`,
+      ts: i,
+    }));
+    await writeFile(stateFile, JSON.stringify(state));
+
+    // Open a stream and disconnect it while its findByKey await is still in flight. The buggy path
+    // registered req.on("close", cleanup) only AFTER those awaits, so the close fired with no
+    // listener; the handler then claimed the slot and never freed it.
+    const leakController = new AbortController();
+    controllers.push(leakController);
+    const leaked = fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: leakController.signal,
+    }).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    leakController.abort();
+    await leaked;
+
+    // With the slot leaked (maxStreamClients=1) no later stream can ever be admitted; the fix bails
+    // out before claiming the slot, so a fresh stream opens 200.
+    let admitted = null;
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const res = await openStream();
+      if (res.status === 200) {
+        admitted = res;
+        break;
+      }
+      await res.json().catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(admitted, "a stream that disconnects during setup must not leak its slot");
   } finally {
     for (const controller of controllers) controller.abort();
     await server.close();
