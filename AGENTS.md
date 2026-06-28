@@ -89,7 +89,7 @@ State lives at `~/.lavish-axi/state.json` (override with `LAVISH_AXI_STATE_DIR`)
    An open stream counts as a live poll for presence, so the browser shows `listening` and keeps the Send button active.
    `--agent-reply "..."` (optionally `--reply-to <id>`) posts a reply before streaming.
 10. The `/events/:key` SSE stream emits `agent-presence` states: `waiting` before any poll or stream has attached, `listening` while a poll or stream is active, and `working` after feedback has been delivered and released.
-    The chrome uses this state to show the waiting banner, allow queued feedback while waiting or listening, and block sends only while working.
+    The chrome uses this state to drive the waiting banner and the working spinner, but sends are always-on: a message is accepted and delivered in any presence state (`waiting`, `listening`, or `working`), and the composer is blocked only once the session has ended.
 11. `--agent-reply` (on `poll` or `stream`) posts a chat message into the session before waiting, so the agent's reply renders in the browser conversation panel via the `/events/:key` SSE stream's `agent-reply` event, which now forwards the whole persisted message object (including its server-assigned `id`) rather than just the text.
     On `stream`, `--reply-to <id>` threads the reply under a specific message; an unknown or forged `reply_to` is dropped.
     The same SSE stream re-broadcasts the transcript with a `chat-sync` event whenever the chat changes (e.g. a queued user message), so the browser can tag its just-sent bubbles with the server ids that make them reply-able.
