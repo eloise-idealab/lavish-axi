@@ -40,7 +40,7 @@ const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_MAX_STREAM_CLIENTS = 16;
 
 // A detached server should not live forever. When no browser chrome (SSE) and no agent poll
-// are connected for this long, the server shuts itself down so it stops dangling. The next
+// or stream are connected for this long, the server shuts itself down so it stops dangling. The next
 // `lavish-axi <file>` invocation re-spawns a fresh server and adopts the session from
 // state.json. Set LAVISH_AXI_IDLE_TIMEOUT_MS to 0/off to disable, or to a custom millisecond
 // budget.
