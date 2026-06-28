@@ -124,6 +124,31 @@ test("user's own message survives the agent draining the queue + chat-sync (disa
   assert.equal(afterSync[0].id, "S1", "optimistic local id reconciled to the durable server id");
 });
 
+test("id-less legacy chat entries render as un-threadable roots (pre-merge session upgrade)", async () => {
+  const chrome = await createChromeHarness();
+
+  // A session persisted by the pre-merge server has chat entries without server-assigned ids.
+  // After upgrading they must still show in the panel, just as plain un-threadable roots.
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [
+        { role: "user", text: "legacy one", at: 1 },
+        { role: "agent", text: "legacy two", at: 2 },
+      ],
+    }),
+  });
+
+  assert.deepEqual(
+    chrome.threadingOrdered().map((m) => m.text),
+    ["legacy one", "legacy two"],
+    "id-less legacy messages are kept in the render set, not dropped",
+  );
+  const html = chrome.chatLogHtml();
+  assert.ok(html.includes("legacy one") && html.includes("legacy two"), "both legacy messages render");
+  assert.ok(!html.includes("thread-chip"), "id-less roots have no thread chip");
+  assert.ok(!html.includes("reply-button"), "id-less roots expose no reply affordance");
+});
+
 test("Send button stays active and still posts while the agent is working (change #2)", async () => {
   const chrome = await createChromeHarness();
 

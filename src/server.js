@@ -592,6 +592,7 @@ export async function serve({
       const sendChatSync = async (key) => {
         if (key !== req.params.key || res.writableEnded) return;
         const fresh = await store.findByKey(key);
+        if (res.writableEnded) return;
         res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: fresh?.chat || [] })}\n\n`);
       };
       res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: session?.chat || [] })}\n\n`);

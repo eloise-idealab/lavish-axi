@@ -47,7 +47,7 @@ let pendingSnapshot = "";
 // whose thread is currently open ("" = none).
 /** @type {Map<string, ChatMsg>} */
 const messagesById = new Map();
-/** @type {string[]} */
+/** @type {(string|ChatMsg)[]} */
 const messageOrder = [];
 let openThreadRootId = "";
 /** @type {Map<string, number>} */
@@ -375,7 +375,7 @@ function rememberMessage(message) {
     if (!messagesById.has(id)) messageOrder.push(id);
     messagesById.set(id, message);
   } else {
-    messageOrder.push("");
+    messageOrder.push(message);
   }
 }
 
@@ -397,12 +397,14 @@ function setMessages(chat) {
 function orderedMessages() {
   const seen = new Set();
   const list = [];
-  for (const id of messageOrder) {
-    if (id) {
-      if (seen.has(id)) continue;
-      seen.add(id);
-      const m = messagesById.get(id);
+  for (const entry of messageOrder) {
+    if (typeof entry === "string") {
+      if (seen.has(entry)) continue;
+      seen.add(entry);
+      const m = messagesById.get(entry);
       if (m) list.push(m);
+    } else if (entry) {
+      list.push(entry);
     }
   }
   return list;
