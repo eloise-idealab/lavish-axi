@@ -1,6 +1,15 @@
-/* global CSS, Element, ResizeObserver, document, getComputedStyle, parent, window */
+/* global CSS, Element, MutationObserver, ResizeObserver, document, getComputedStyle, parent, window */
+
+import * as mermaidHelpers from "./mermaid-node.js";
 
 export const LAVISH_INTERNAL_QUEUE_KEY = "_lavishQueueKey";
+
+export const MODE_TOGGLE_HOTKEY_KEY = "i";
+
+export function isModeToggleHotkeyEvent(event) {
+  if (event.shiftKey || event.altKey) return false;
+  return Boolean(event.metaKey || event.ctrlKey) && String(event.key || "").toLowerCase() === MODE_TOGGLE_HOTKEY_KEY;
+}
 
 // Derive the browser-only replacement key used to collapse unsent updates for the same input.
 // The key is stripped by the chrome before prompts are sent to the server or returned by poll.
@@ -113,7 +122,88 @@ export function isNativeInteractiveControl(el) {
   );
 }
 
-export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNativeInteractiveControl) {
+// Wrapped inline text (a bold phrase or code token that breaks across a line) reports one
+// getBoundingClientRect() spanning both lines, so a bounding-box intersection test "overlaps"
+// every element sitting in the reflow gap between the fragments even though nothing is actually
+// drawn there. Comparing real per-line fragments (getClientRects()) instead only flags overlap
+// where rendered pixels of unrelated elements actually collide.
+export function fragmentsSignificantlyOverlap(fragmentsA, fragmentsB, { minAreaRatio = 0.25, minAreaPx = 24 } = {}) {
+  function rectAreaOf(rect) {
+    return Math.max(0, rect.width) * Math.max(0, rect.height);
+  }
+
+  function intersectionAreaOf(a, b) {
+    const width = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+    const height = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+    return width * height;
+  }
+
+  for (const a of fragmentsA) {
+    const threshold = Math.min(rectAreaOf(a) * minAreaRatio, minAreaPx);
+    for (const b of fragmentsB) {
+      if (intersectionAreaOf(a, b) >= threshold) return true;
+    }
+  }
+  return false;
+}
+
+// scrollWidth/scrollHeight can only exceed clientWidth/clientHeight when something constrains
+// the box's size (a fixed height/width, or a flex/grid item smaller than its content) - a box
+// that simply grows to fit its content always has scrollHeight === clientHeight, so this never
+// false-positives on ordinary auto-sized elements.
+export function classifyHorizontalOverflow({ scrollWidth, clientWidth, overflowX, hasText, isTruncated, epsilon = 1 }) {
+  const overflowPx = clientWidth > 0 ? scrollWidth - clientWidth : 0;
+  if (overflowPx <= epsilon) return null;
+  const clipsText = hasText && (overflowX === "hidden" || overflowX === "clip") && !isTruncated;
+  return { overflowPx, kind: clipsText ? "clipped-text" : "element-scroll-overflow" };
+}
+
+// Fixed-size badges/buttons/pills usually leave overflow at its default "visible" rather than
+// "hidden" - the text doesn't get clipped, it spills out of the box and overlaps neighboring
+// content, which is just as broken. Only "auto"/"scroll" are treated as intentional (the user
+// can reach the content), so those are the only values this ignores. `clips` distinguishes a
+// hard clip (hidden/clip - content invisible) from a visible spill: a spill's overflow bubbles
+// into every unconstrained block ancestor's own scrollHeight too, so callers must dedup those
+// against the innermost element actually responsible before reporting.
+export function classifyVerticalOverflow({ scrollHeight, clientHeight, overflowY, hasText, isTruncated, epsilon = 1 }) {
+  const overflowPx = clientHeight > 0 ? scrollHeight - clientHeight : 0;
+  if (overflowPx <= epsilon) return null;
+  const scrollable = overflowY === "auto" || overflowY === "scroll";
+  if (scrollable || !hasText || isTruncated) return null;
+  const clips = overflowY === "hidden" || overflowY === "clip";
+  return { overflowPx, kind: "clipped-text", clips };
+}
+
+export function resolveVisibleSpillCandidates(spillCandidates, { epsilon = 1 } = {}) {
+  function spillBottomEdge(candidate) {
+    const explicit = Number(candidate.spillBottom);
+    if (Number.isFinite(explicit)) return explicit;
+    const rectBottom = Number(candidate.rect?.bottom);
+    const overflowPx = Number(candidate.overflowPx);
+    if (!Number.isFinite(rectBottom) || !Number.isFinite(overflowPx)) return null;
+    return rectBottom + overflowPx;
+  }
+
+  function sameSpillEdge(candidate, other) {
+    const candidateBottom = spillBottomEdge(candidate);
+    const otherBottom = spillBottomEdge(other);
+    return candidateBottom !== null && otherBottom !== null && Math.abs(candidateBottom - otherBottom) <= epsilon;
+  }
+
+  return spillCandidates.filter(
+    (candidate) =>
+      !spillCandidates.some(
+        (other) => other.el !== candidate.el && candidate.el.contains(other.el) && sameSpillEdge(candidate, other),
+      ),
+  );
+}
+
+export function createArtifactSdk(
+  deriveQueueKey,
+  isNativeInteractive = isNativeInteractiveControl,
+  mermaid = mermaidHelpers,
+) {
+  const { isMermaidSvg, mermaidNodeFrom, mermaidNodeElement } = mermaid;
   let annotationMode = true;
   let hovered = null;
   let selected = null;
@@ -125,6 +215,13 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
   function uid(el) {
     if (!ids.has(el)) ids.set(el, String(++counter));
     return ids.get(el);
+  }
+
+  function escapeAnnotationText(value) {
+    return String(value).replace(
+      /[&<>"']/g,
+      (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char],
+    );
   }
 
   function selector(el) {
@@ -153,12 +250,263 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
   }
 
   function context(el) {
-    return {
+    const base = {
       uid: uid(el),
       selector: selector(el),
       tag: (el.tagName || "").toLowerCase(),
       text: (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 240),
     };
+
+    const mermaidNode = mermaidNodeFrom(el, selector);
+    if (mermaidNode) {
+      base.tag = "mermaid-node";
+      base.text = mermaidNode.label || base.text;
+      base.target = mermaidNode;
+    }
+
+    return base;
+  }
+
+  // Hover and click must outline the exact element they annotate. Clicking inside
+  // a Mermaid diagram annotates the whole <g> node, so resolve a raw event target
+  // up to that node before highlighting; every other element annotates itself.
+  function annotationTargetEl(el) {
+    return mermaidNodeElement(el) || el;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Mermaid diagram enhancement: pan/zoom in explore mode, freeze in annotate
+  // mode. All of this operates on the rendered SVG only; the saved artifact is
+  // never modified, so a diagram still renders identically when opened directly.
+  // Node identity/label extraction lives in the injected `mermaid` helpers so it
+  // can be unit tested and shared with the server-side target validator.
+  // ---------------------------------------------------------------------------
+
+  const mermaidViewports = new WeakMap();
+
+  function findMermaidSvgs() {
+    const svgs = new Set();
+    for (const svg of document.querySelectorAll("svg")) {
+      if (isMermaidSvg(svg)) svgs.add(svg);
+    }
+    return [...svgs];
+  }
+
+  // A minimal, dependency-free viewBox-based pan/zoom. Kept small on purpose:
+  // "nodes only" annotation plus freeze-on-annotate means we do not need
+  // momentum, gestures, or a full pan/zoom library here. svg-pan-zoom is a
+  // documented drop-in upgrade if richer interaction is wanted later.
+  function createViewport(svg) {
+    const bbox = svg.getBBox ? safeBBox(svg) : null;
+    const initial = readViewBox(svg) || (bbox ? { x: bbox.x, y: bbox.y, w: bbox.width, h: bbox.height } : null);
+    if (!initial) return null;
+    svg.setAttribute("viewBox", `${initial.x} ${initial.y} ${initial.w} ${initial.h}`);
+
+    const view = { ...initial };
+    let frozen = false;
+    let panning = null;
+
+    function apply() {
+      svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+    }
+    function reset() {
+      Object.assign(view, initial);
+      apply();
+    }
+    function zoomAt(clientX, clientY, factor) {
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const px = (clientX - rect.left) / rect.width;
+      const py = (clientY - rect.top) / rect.height;
+      const fx = view.x + view.w * px;
+      const fy = view.y + view.h * py;
+      const next = Math.min(Math.max(view.w * factor, initial.w / 40), initial.w * 8);
+      const scale = next / view.w;
+      view.w = next;
+      view.h *= scale;
+      view.x = fx - (fx - view.x) * scale;
+      view.y = fy - (fy - view.y) * scale;
+      apply();
+    }
+
+    function onWheel(event) {
+      if (frozen) return;
+      event.preventDefault();
+      zoomAt(event.clientX, event.clientY, event.deltaY > 0 ? 1.15 : 1 / 1.15);
+    }
+    function onPointerDown(event) {
+      if (frozen || event.button !== 0) return;
+      panning = { x: event.clientX, y: event.clientY, vx: view.x, vy: view.y };
+      svg.setPointerCapture?.(event.pointerId);
+      svg.style.cursor = "grabbing";
+    }
+    function onPointerMove(event) {
+      if (!panning) return;
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      view.x = panning.vx - ((event.clientX - panning.x) / rect.width) * view.w;
+      view.y = panning.vy - ((event.clientY - panning.y) / rect.height) * view.h;
+      apply();
+    }
+    function onPointerUp(event) {
+      panning = null;
+      svg.releasePointerCapture?.(event.pointerId);
+      svg.style.cursor = frozen ? "" : "grab";
+    }
+
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    svg.addEventListener("pointerdown", onPointerDown);
+    svg.addEventListener("pointermove", onPointerMove);
+    svg.addEventListener("pointerup", onPointerUp);
+    svg.addEventListener("pointercancel", onPointerUp);
+
+    function setFrozen(next) {
+      frozen = !!next;
+      panning = null;
+      svg.style.cursor = frozen ? "" : "grab";
+      svg.style.touchAction = frozen ? "" : "none";
+    }
+    setFrozen(false);
+
+    return { reset, setFrozen };
+  }
+
+  function safeBBox(svg) {
+    try {
+      return svg.getBBox();
+    } catch {
+      return null;
+    }
+  }
+
+  function readViewBox(svg) {
+    const raw = svg.getAttribute?.("viewBox");
+    if (!raw) return null;
+    const parts = raw
+      .trim()
+      .split(/[\s,]+/)
+      .map(Number);
+    if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n))) return null;
+    return { x: parts[0], y: parts[1], w: parts[2], h: parts[3] };
+  }
+
+  // Inline whiteboard embedding. Each rendered diagram inside a `.mermaid`
+  // container is replaced, at view time only, by a nested sandboxed iframe
+  // hosting the Excalidraw whiteboard frame - the artifact file keeps its
+  // Mermaid source and still renders plain diagrams when opened standalone or
+  // exported. The index of the container among `.mermaid` elements in document
+  // order is the diagram's identity; the server recovers the matching source
+  // from the artifact file. This SDK owns their lifecycle during fullscreen
+  // transitions.
+  const whiteboardEmbeds = new Map(); // container -> { iframe, index }
+
+  function mermaidContainerIndex(container) {
+    return [...document.querySelectorAll(".mermaid")].indexOf(container);
+  }
+
+  function whiteboardEmbedHeightPx(svgRect) {
+    const headerPx = 96;
+    const min = 360;
+    const max = Math.max(min, Math.round((window.innerHeight || 800) * 0.8));
+    return Math.max(min, Math.min(Math.round(svgRect.height) + headerPx, max));
+  }
+
+  function embedWhiteboard(svg) {
+    const container = svg.closest(".mermaid");
+    if (!container) return;
+    const existing = whiteboardEmbeds.get(container);
+    if (existing && existing.iframe.isConnected) {
+      existing.index = mermaidContainerIndex(container);
+      return;
+    }
+    const index = mermaidContainerIndex(container);
+    if (index < 0) return;
+    const rect = svg.getBoundingClientRect();
+    // Mermaid renders asynchronously; a zero-ish rect means this svg has not
+    // been laid out yet. Skip it and retry shortly - layout completion does
+    // not necessarily mutate the DOM again, so the observer alone is not a
+    // guaranteed wake-up.
+    if (rect.height < 40) {
+      window.setTimeout(scheduleMermaidEnhance, 150);
+      return;
+    }
+    const iframe = document.createElement("iframe");
+    iframe.setAttribute("data-lavish-ui", "whiteboard-inline");
+    iframe.setAttribute("title", "Excalidraw whiteboard");
+    // Stricter than (and independent of) this artifact frame's own sandbox.
+    iframe.setAttribute("sandbox", "allow-scripts allow-popups");
+    iframe.src = whiteboardFrameSrc({ index, diagramId: svg.id || "" });
+    iframe.style.cssText =
+      `display:block;width:100%;height:${whiteboardEmbedHeightPx(rect)}px;border:1px solid rgba(128,128,128,.35);` +
+      "border-radius:12px;background:transparent";
+    // The design snippet re-renders Mermaid inside the container on theme
+    // changes, so the frame lives as a sibling: re-renders stay harmless
+    // inside the hidden container instead of destroying the editor.
+    container.style.display = "none";
+    container.insertAdjacentElement("afterend", iframe);
+    whiteboardEmbeds.set(container, { iframe, index, diagramId: svg.id || "" });
+  }
+
+  function whiteboardEmbedEntries() {
+    return [...whiteboardEmbeds.values()].filter((entry) => entry.iframe.isConnected);
+  }
+
+  function whiteboardEntryByIndex(index) {
+    return whiteboardEmbedEntries().find((entry) => entry.index === Number(index)) || null;
+  }
+
+  function whiteboardFrameSrc(entry) {
+    const params = new URLSearchParams({
+      diagramIndex: String(entry.index),
+      diagramId: String(entry.diagramId || ""),
+    });
+    return `/whiteboard-frame?${params}`;
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== parent) return;
+    const msg = event.data || {};
+    // While the chrome overlay edits a diagram fullscreen, its inline frame is
+    // parked on about:blank so two editors never autosave the same sidecar;
+    // resume reboots the frame, which re-inits from the latest saved scene.
+    if (msg.type === "lavish:suspendWhiteboard") {
+      const target = whiteboardEntryByIndex(msg.diagramIndex);
+      if (target) target.iframe.src = "about:blank";
+    }
+    if (msg.type === "lavish:resumeWhiteboard") {
+      const target = whiteboardEntryByIndex(msg.diagramIndex);
+      if (target) target.iframe.src = whiteboardFrameSrc(target);
+    }
+  });
+
+  function enhanceMermaid() {
+    for (const svg of findMermaidSvgs()) {
+      embedWhiteboard(svg);
+      if (mermaidViewports.has(svg)) continue;
+      const viewport = createViewport(svg);
+      if (viewport) {
+        viewport.setFrozen(annotationMode);
+        mermaidViewports.set(svg, viewport);
+      }
+    }
+  }
+
+  let mermaidEnhanceScheduled = false;
+  function scheduleMermaidEnhance() {
+    if (mermaidEnhanceScheduled) return;
+    mermaidEnhanceScheduled = true;
+    const run = () => {
+      mermaidEnhanceScheduled = false;
+      enhanceMermaid();
+    };
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(run);
+    else window.setTimeout(run, 50);
+  }
+
+  function setMermaidFrozen(frozen) {
+    for (const svg of findMermaidSvgs()) {
+      mermaidViewports.get(svg)?.setFrozen(frozen);
+    }
   }
 
   function closestElement(node) {
@@ -277,6 +625,10 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
     }
     if (!annotationMode && style) style.remove();
     if (!annotationMode) closeCard();
+
+    // Freeze Mermaid pan/zoom while annotating so nodes sit at stable screen
+    // positions and a click resolves cleanly to one node instead of panning.
+    setMermaidFrozen(annotationMode);
   }
 
   function queuePrompt(prompt, options = {}) {
@@ -358,12 +710,6 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
     return Math.max(0, rect.width) * Math.max(0, rect.height);
   }
 
-  function intersectionArea(a, b) {
-    const width = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
-    const height = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
-    return width * height;
-  }
-
   function isVisibleForLayoutAudit(el, rect = el.getBoundingClientRect()) {
     if (!el || isLavishUi(el) || rect.width <= 0 || rect.height <= 0) return false;
     const style = getComputedStyle(el);
@@ -436,42 +782,60 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
     return style.textOverflow === "ellipsis" || Number.parseInt(style.webkitLineClamp || "0", 10) > 0;
   }
 
-  function auditElementOverflow(el, viewportWidth, findings, seen) {
+  function auditElementOverflow(el, viewportWidth, findings, seen, spillCandidates) {
     if (el === document.body || el === document.documentElement || hasIntentionalHorizontalScrollerAncestor(el)) return;
 
     const rect = el.getBoundingClientRect();
     if (!isVisibleForLayoutAudit(el, rect)) return;
 
     const style = getComputedStyle(el);
-    const scrollOverflowPx = el.clientWidth > 0 ? el.scrollWidth - el.clientWidth : 0;
-    if (scrollOverflowPx > layoutAuditOverflowEpsilon) {
-      const clipsText =
-        hasReadableText(el) &&
-        (style.overflowX === "hidden" || style.overflowX === "clip") &&
-        !isIntentionalTextTruncation(style);
+    const hasText = hasReadableText(el);
+    const isTruncated = isIntentionalTextTruncation(style);
+
+    const horizontal = classifyHorizontalOverflow({
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+      overflowX: style.overflowX,
+      hasText,
+      isTruncated,
+      epsilon: layoutAuditOverflowEpsilon,
+    });
+    if (horizontal) {
       pushLayoutFinding(findings, seen, {
         selector: selector(el),
-        kind: clipsText ? "clipped-text" : "element-scroll-overflow",
-        overflowPx: scrollOverflowPx,
+        kind: horizontal.kind,
+        overflowPx: horizontal.overflowPx,
         viewportWidth,
-        severity: clipsText ? "error" : overflowSeverity(scrollOverflowPx),
+        severity: horizontal.kind === "clipped-text" ? "error" : overflowSeverity(horizontal.overflowPx),
       });
     }
 
-    const verticalClipPx = el.clientHeight > 0 ? el.scrollHeight - el.clientHeight : 0;
-    if (
-      verticalClipPx > layoutAuditOverflowEpsilon &&
-      hasReadableText(el) &&
-      (style.overflowY === "hidden" || style.overflowY === "clip") &&
-      !isIntentionalTextTruncation(style)
-    ) {
-      pushLayoutFinding(findings, seen, {
-        selector: selector(el),
-        kind: "clipped-text",
-        overflowPx: verticalClipPx,
-        viewportWidth,
-        severity: "error",
-      });
+    const vertical = classifyVerticalOverflow({
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+      overflowY: style.overflowY,
+      hasText,
+      isTruncated,
+      epsilon: layoutAuditOverflowEpsilon,
+    });
+    if (vertical) {
+      if (vertical.clips) {
+        pushLayoutFinding(findings, seen, {
+          selector: selector(el),
+          kind: vertical.kind,
+          overflowPx: vertical.overflowPx,
+          viewportWidth,
+          severity: "error",
+        });
+      } else {
+        spillCandidates.push({
+          el,
+          selector: selector(el),
+          overflowPx: vertical.overflowPx,
+          viewportWidth,
+          spillBottom: rect.bottom + vertical.overflowPx,
+        });
+      }
     }
 
     const parent = el.parentElement;
@@ -493,40 +857,66 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
     }
   }
 
+  function resolveSpillCandidates(spillCandidates, findings, seen) {
+    for (const candidate of resolveVisibleSpillCandidates(spillCandidates, { epsilon: layoutAuditOverflowEpsilon })) {
+      pushLayoutFinding(findings, seen, {
+        selector: candidate.selector,
+        kind: "clipped-text",
+        overflowPx: candidate.overflowPx,
+        viewportWidth: candidate.viewportWidth,
+        severity: "error",
+      });
+    }
+  }
+
+  // getClientRects() returns one rect per rendered line fragment; falls back to the bounding
+  // rect for elements the browser doesn't fragment (e.g. replaced elements).
+  function elementLineFragments(el) {
+    const rects = [...el.getClientRects()].filter((r) => r.width > 0 && r.height > 0);
+    if (rects.length) return rects;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 ? [rect] : [];
+  }
+
   function auditOverlappingText(elements, viewportWidth, findings, seen) {
     const candidates = elements
       .filter((el) => el.children.length === 0 && hasReadableText(el))
       .filter((el) => isVisibleForLayoutAudit(el))
+      .filter((el) => getComputedStyle(el).position === "static")
       .slice(0, 200);
 
     for (const el of candidates) {
-      const rect = el.getBoundingClientRect();
-      if (rectArea(rect) < 16) continue;
-      const points = [
-        { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
-        { x: rect.left + Math.min(4, rect.width / 2), y: rect.top + Math.min(4, rect.height / 2) },
-        { x: rect.right - Math.min(4, rect.width / 2), y: rect.bottom - Math.min(4, rect.height / 2) },
-      ];
-      for (const point of points) {
-        if (point.x < 0 || point.y < 0 || point.x > viewportWidth || point.y > window.innerHeight) continue;
-        const top = document.elementFromPoint(point.x, point.y);
-        if (!(top instanceof Element) || top === el || el.contains(top) || top.contains(el) || isLavishUi(top))
-          continue;
-        if (hasIntentionalHorizontalScrollerAncestor(top)) continue;
-        const elPosition = getComputedStyle(el).position;
-        const topPosition = getComputedStyle(top).position;
-        if (elPosition !== "static" || topPosition !== "static") continue;
-        const topRect = top.getBoundingClientRect();
-        const overlapArea = intersectionArea(rect, topRect);
-        if (overlapArea < Math.min(rectArea(rect) * 0.25, 24)) continue;
-        pushLayoutFinding(findings, seen, {
-          selector: selector(el),
-          kind: "overlapping-text",
-          overflowPx: 0,
-          viewportWidth,
-          severity: "error",
-        });
-        break;
+      const fragments = elementLineFragments(el);
+      let flagged = false;
+
+      for (const rect of fragments) {
+        if (flagged) break;
+        if (rectArea(rect) < 16) continue;
+        const points = [
+          { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
+          { x: rect.left + Math.min(4, rect.width / 2), y: rect.top + Math.min(4, rect.height / 2) },
+          { x: rect.right - Math.min(4, rect.width / 2), y: rect.bottom - Math.min(4, rect.height / 2) },
+        ];
+        for (const point of points) {
+          if (point.x < 0 || point.y < 0 || point.x > viewportWidth || point.y > window.innerHeight) continue;
+          const top = document.elementFromPoint(point.x, point.y);
+          if (!(top instanceof Element) || top === el || el.contains(top) || top.contains(el) || isLavishUi(top))
+            continue;
+          if (hasIntentionalHorizontalScrollerAncestor(top)) continue;
+          if (getComputedStyle(top).position !== "static") continue;
+          if (!fragmentsSignificantlyOverlap([rect], elementLineFragments(top))) continue;
+          pushLayoutFinding(findings, seen, {
+            selector: selector(el),
+            kind: "overlapping-text",
+            overflowPx: 0,
+            viewportWidth,
+            // Heuristic and sampling-based even after fragment-aware matching, so it stays a
+            // warning rather than holding the open-time gate the way a real clip/overflow does.
+            severity: "warning",
+          });
+          flagged = true;
+          break;
+        }
       }
     }
   }
@@ -547,7 +937,9 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
     }
 
     const elements = collectLayoutAuditElements();
-    for (const el of elements) auditElementOverflow(el, viewportWidth, findings, seen);
+    const spillCandidates = [];
+    for (const el of elements) auditElementOverflow(el, viewportWidth, findings, seen, spillCandidates);
+    resolveSpillCandidates(spillCandidates, findings, seen);
     auditOverlappingText(elements, viewportWidth, findings, seen);
     return findings;
   }
@@ -668,21 +1060,31 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
     closeCard();
 
     const c = options.context || context(target);
+    let anchor = target;
     if (options.range) {
       highlightTextRange(options.range);
     } else {
-      selected = target;
+      anchor = annotationTargetEl(target);
+      selected = anchor;
       highlightElement(selected);
     }
 
-    const rect = options.range ? options.range.getBoundingClientRect() : target.getBoundingClientRect();
+    const rect = options.range ? options.range.getBoundingClientRect() : anchor.getBoundingClientRect();
     const card = document.createElement("div");
     card.className = "lavish-annotation-card";
-    const heading = c.tag === "text" ? "Annotate text" : "Annotate &lt;" + c.tag + "&gt;";
+    const nodeLabel = c.tag === "mermaid-node" ? c.target?.label || c.text || "" : "";
+    const heading =
+      c.tag === "text"
+        ? "Annotate text"
+        : c.tag === "mermaid-node"
+          ? "Annotate node" + (nodeLabel ? ": " + escapeAnnotationText(nodeLabel) : "")
+          : "Annotate &lt;" + c.tag + "&gt;";
     const placeholder =
       c.tag === "text"
         ? "Tell the agent what to change about this text..."
-        : "Tell the agent what to change about this element...";
+        : c.tag === "mermaid-node"
+          ? "Tell the agent what to change about this diagram node..."
+          : "Tell the agent what to change about this element...";
     card.innerHTML =
       '<div class="lavish-heading">' +
       heading +
@@ -749,6 +1151,20 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
     }
   });
 
+  // Capture phase so the mode hotkey fires no matter where focus is inside the artifact -
+  // including a checkbox, button, link, or the annotation-card textarea - without disturbing
+  // normal typing. This SDK doesn't own the mode state; it asks the chrome to toggle the same
+  // state the on-screen switch drives, via the same postMessage protocol as setAnnotationMode.
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (!isModeToggleHotkeyEvent(event)) return;
+      event.preventDefault();
+      parent.postMessage({ type: "lavish:toggleAnnotationMode" }, "*");
+    },
+    true,
+  );
+
   // Report scroll position to the chrome so it can be restored across hot reloads.
   // The iframe is sandboxed without same-origin, so the chrome can't read scrollY directly.
   let scrollFrame = 0;
@@ -774,9 +1190,10 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
         isInteractiveControl(event.target)
       )
         return;
-      if (event.target === selected) return;
+      const target = annotationTargetEl(event.target);
+      if (target === selected) return;
       if (hovered && hovered !== selected) clearHighlight(hovered);
-      hovered = event.target;
+      hovered = target;
       highlightElement(hovered);
     },
     true,
@@ -840,4 +1257,13 @@ export function createArtifactSdk(deriveQueueKey, isNativeInteractive = isNative
   } else {
     startLayoutAudit();
   }
+
+  // Mermaid renders asynchronously (and can re-render on theme/resize), so we
+  // enhance on load, again shortly after, and whenever the DOM adds new SVGs.
+  enhanceMermaid();
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", enhanceMermaid, { once: true });
+  }
+  const mermaidObserver = new MutationObserver(() => scheduleMermaidEnhance());
+  mermaidObserver.observe(document.documentElement, { childList: true, subtree: true });
 }

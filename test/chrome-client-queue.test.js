@@ -27,6 +27,28 @@ test("chrome client replaces queued prompts with the same internal key", async (
   assert.doesNotMatch(chrome.element("annotationPills").innerHTML, /Use plan A/);
 });
 
+test("chrome client scrolls new chat bubbles into view above queued prompts", async () => {
+  const chrome = await createChromeHarness();
+  const panelScroll = chrome.element("panelScroll");
+  panelScroll.scrollHeight = 1800;
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Review the title", selector: "h1", tag: "annotation", text: "Title" },
+  });
+  assert.equal(panelScroll.scrollTop, 1800);
+
+  panelScroll.scrollTop = 640;
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ text: "I updated the title." }),
+  });
+
+  const bubble = chrome.element("chatLog").lastAppendedChild;
+  assert.equal(bubble.scrolledIntoView.block, "nearest");
+  assert.equal(bubble.scrolledIntoView.inline, "nearest");
+  assert.equal(panelScroll.scrollTop, 640);
+});
+
 test("chrome client posts layout warnings from the artifact iframe", async () => {
   const posts = [];
   const chrome = await createChromeHarness({
@@ -63,6 +85,196 @@ test("chrome client posts layout warnings from the artifact iframe", async () =>
       },
     ],
   });
+});
+
+test("chrome client surfaces export warnings from the server response", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      headers: {
+        get(name) {
+          if (name.toLowerCase() === "x-lavish-export-warning-count") return "1";
+          return null;
+        },
+      },
+      blob: async () => ({}),
+    }),
+  });
+
+  await chrome.element("exportArtifact").onclick();
+  await flushPromises();
+
+  assert.equal(chrome.element("exportArtifact").querySelector("span").textContent, "Exported with 1 unresolved asset");
+});
+
+test("chrome client surfaces export notices from the server response", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      headers: {
+        get(name) {
+          if (name.toLowerCase() === "x-lavish-export-warning-count") return "0";
+          if (name.toLowerCase() === "x-lavish-export-notice-count") return "1";
+          return null;
+        },
+      },
+      blob: async () => ({}),
+    }),
+  });
+
+  await chrome.element("exportArtifact").onclick();
+  await flushPromises();
+
+  assert.equal(chrome.element("exportArtifact").querySelector("span").textContent, "Exported with 1 notice");
+});
+
+test("chrome client includes export notices alongside unresolved assets", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      headers: {
+        get(name) {
+          if (name.toLowerCase() === "x-lavish-export-warning-count") return "2";
+          if (name.toLowerCase() === "x-lavish-export-notice-count") return "1";
+          return null;
+        },
+      },
+      blob: async () => ({}),
+    }),
+  });
+
+  await chrome.element("exportArtifact").onclick();
+  await flushPromises();
+
+  assert.equal(
+    chrome.element("exportArtifact").querySelector("span").textContent,
+    "Exported with 2 unresolved assets and 1 notice",
+  );
+});
+
+test("chrome client surfaces share warnings from the server response", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({
+        url: "https://abc123.ht-ml.app/",
+        update_key: "uk_secret",
+        warnings: [
+          { kind: "load-failed", ref: "missing.png" },
+          { kind: "csp-meta", ref: "script-src 'self'" },
+        ],
+        unresolved_local_assets: [{ kind: "load-failed", ref: "missing.png" }],
+        notices: [{ kind: "csp-meta", ref: "script-src 'self'" }],
+      }),
+    }),
+  });
+  const submit = chrome.element("shareForm").listeners.get("submit");
+  assert.equal(typeof submit, "function");
+
+  await submit({ preventDefault() {} });
+  await flushPromises();
+
+  assert.equal(chrome.element("shareStatus").textContent, "Published with 1 unresolved local asset and 1 notice.");
+  assert.equal(chrome.element("shareResult").hidden, false);
+});
+
+test("chrome client does not count share notices as unresolved assets", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({
+        url: "https://abc123.ht-ml.app/",
+        update_key: "uk_secret",
+        warnings: [{ kind: "csp-meta", ref: "script-src 'self'" }],
+        notices: [{ kind: "csp-meta", ref: "script-src 'self'" }],
+      }),
+    }),
+  });
+  const submit = chrome.element("shareForm").listeners.get("submit");
+  assert.equal(typeof submit, "function");
+
+  await submit({ preventDefault() {} });
+  await flushPromises();
+
+  assert.equal(chrome.element("shareStatus").textContent, "Published with 1 notice.");
+  assert.equal(chrome.element("shareResult").hidden, false);
+});
+
+test("chrome client clears stale share passwords when opening a fresh dialog", async () => {
+  const chrome = await createChromeHarness();
+
+  chrome.element("sharePassword").value = "old-password";
+  chrome.element("shareArtifact").onclick();
+
+  assert.equal(chrome.element("sharePassword").value, "");
+});
+
+test("chrome client preserves share passwords during an in-dialog retry", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: false,
+      json: async () => ({ error: "publish failed" }),
+    }),
+  });
+
+  chrome.element("shareArtifact").onclick();
+  chrome.element("sharePassword").value = "pw";
+  const submit = chrome.element("shareForm").listeners.get("submit");
+  assert.equal(typeof submit, "function");
+
+  await submit({ preventDefault() {} });
+  await flushPromises();
+
+  assert.equal(chrome.element("sharePassword").value, "pw");
+  assert.equal(chrome.element("shareStatus").textContent, "publish failed");
+});
+
+test("chrome client says password-protected shares also require the password", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({
+        url: "https://abc123.ht-ml.app/",
+        update_key: "uk_secret",
+      }),
+    }),
+  });
+  chrome.element("sharePassword").value = "pw";
+  const submit = chrome.element("shareForm").listeners.get("submit");
+  assert.equal(typeof submit, "function");
+
+  await submit({ preventDefault() {} });
+  await flushPromises();
+
+  assert.equal(
+    chrome.element("shareStatus").textContent,
+    "Published. This page is PASSWORD-PROTECTED; viewers also need the password.",
+  );
+});
+
+test("chrome client treats a whitespace-only share password as public", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (_url, init) => {
+      posts.push(JSON.parse(init.body));
+      return {
+        ok: true,
+        json: async () => ({
+          url: "https://abc123.ht-ml.app/",
+          update_key: "uk_secret",
+        }),
+      };
+    },
+  });
+  chrome.element("sharePassword").value = "   ";
+  const submit = chrome.element("shareForm").listeners.get("submit");
+  assert.equal(typeof submit, "function");
+
+  await submit({ preventDefault() {} });
+  await flushPromises();
+
+  assert.deepEqual(posts, [{}]);
+  assert.equal(chrome.element("shareStatus").textContent, "Published. Anyone with the link can view this page.");
 });
 
 test("chrome client registers message listener before loading the artifact iframe", async () => {
@@ -270,4 +482,554 @@ test("chrome client strips the internal queue key before posting prompts", async
     domSnapshot: "uid=1 body",
   });
   assert.equal(chrome.queued().length, 0);
+});
+
+test("chrome send and end carries the end intent with queued prompts", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      return { ok: true };
+    },
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" },
+  });
+  chrome.element("sendAndEnd").onclick();
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:requestSnapshot");
+
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  await flushPromises();
+
+  assert.deepEqual(
+    posts.map((post) => post.url),
+    ["/api/abc/prompts"],
+  );
+  assert.deepEqual(posts[0].body, {
+    prompts: [{ prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" }],
+    domSnapshot: "uid=1 body",
+    endSession: true,
+  });
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("chatInput").disabled, true);
+});
+
+test("chrome send and end with an empty composer nudges instead of ending", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      return { ok: true };
+    },
+  });
+  chrome.element("sendHint").hidden = true;
+
+  chrome.element("sendAndEnd").onclick();
+  await flushPromises();
+
+  assert.equal(posts.length, 0);
+  assert.equal(chrome.postedToFrame.length, 0);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("chatInput").focused, true);
+  assert.equal(chrome.element("chatInput").disabled, false);
+});
+
+test("chrome send and end during an in-flight submit still ends after the submit drains the queue", async () => {
+  const posts = [];
+  let resolveFirstPost = () => {};
+  const firstPost = new Promise((resolve) => {
+    resolveFirstPost = () => resolve();
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      if (posts.length === 1) await firstPost;
+      return { ok: true };
+    },
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" },
+  });
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  assert.equal(posts.length, 1);
+
+  chrome.element("sendAndEnd").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  assert.equal(posts.length, 1);
+
+  resolveFirstPost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.deepEqual(
+    posts.map((post) => post.url),
+    ["/api/abc/prompts", "/api/abc/end"],
+  );
+  assert.deepEqual(posts[0].body, {
+    prompts: [{ prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" }],
+    domSnapshot: "uid=1 body",
+  });
+  assert.equal(posts[1].body, null);
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("chatInput").disabled, true);
+});
+
+test("Cmd/Ctrl+I toggles annotation mode from the chrome document, regardless of focus", async () => {
+  const chrome = await createChromeHarness();
+
+  const metaEvent = chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
+  assert.equal(metaEvent.defaultPrevented, true);
+  assert.equal(chrome.element("annotation")["aria-pressed"], "false");
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:setAnnotationMode");
+  assert.equal(chrome.postedToFrame.at(-1).enabled, false);
+
+  const ctrlEvent = chrome.dispatchDocumentKeydown({ key: "I", ctrlKey: true });
+  assert.equal(ctrlEvent.defaultPrevented, true);
+  assert.equal(chrome.element("annotation")["aria-pressed"], "true");
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:setAnnotationMode");
+  assert.equal(chrome.postedToFrame.at(-1).enabled, true);
+});
+
+test("plain 'i' and other modifier combos do not toggle annotation mode", async () => {
+  const chrome = await createChromeHarness();
+  const framePostCount = () => chrome.postedToFrame.length;
+  const before = framePostCount();
+
+  const bareEvent = chrome.dispatchDocumentKeydown({ key: "i" });
+  assert.equal(bareEvent.defaultPrevented, false);
+  assert.equal(chrome.element("annotation")["aria-pressed"], undefined);
+
+  const shiftEvent = chrome.dispatchDocumentKeydown({ key: "i", shiftKey: true });
+  assert.equal(shiftEvent.defaultPrevented, false);
+
+  const ctrlShiftEvent = chrome.dispatchDocumentKeydown({ key: "i", ctrlKey: true, shiftKey: true });
+  assert.equal(ctrlShiftEvent.defaultPrevented, false);
+
+  const metaAltEvent = chrome.dispatchDocumentKeydown({ key: "i", metaKey: true, altKey: true });
+  assert.equal(metaAltEvent.defaultPrevented, false);
+
+  const otherKeyEvent = chrome.dispatchDocumentKeydown({ key: "s", metaKey: true });
+  assert.equal(otherKeyEvent.defaultPrevented, false);
+
+  assert.equal(framePostCount(), before);
+});
+
+test("chrome client reads the mode toggle hotkey from the session bootstrap", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "k" },
+  });
+
+  const oldHotkeyEvent = chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
+  assert.equal(oldHotkeyEvent.defaultPrevented, false);
+  assert.equal(chrome.element("annotation")["aria-pressed"], undefined);
+
+  const bootstrapHotkeyEvent = chrome.dispatchDocumentKeydown({ key: "K", metaKey: true });
+  assert.equal(bootstrapHotkeyEvent.defaultPrevented, true);
+  assert.equal(chrome.element("annotation")["aria-pressed"], "false");
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:setAnnotationMode");
+  assert.equal(chrome.postedToFrame.at(-1).enabled, false);
+});
+
+test("chrome client toggles annotation mode when the artifact SDK requests it via postMessage", async () => {
+  const chrome = await createChromeHarness();
+
+  chrome.sendFrameMessage({ type: "lavish:toggleAnnotationMode" });
+
+  assert.equal(chrome.element("annotation")["aria-pressed"], "false");
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:setAnnotationMode");
+  assert.equal(chrome.postedToFrame.at(-1).enabled, false);
+
+  chrome.sendFrameMessage({ type: "lavish:toggleAnnotationMode" });
+  assert.equal(chrome.element("annotation")["aria-pressed"], "true");
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:setAnnotationMode");
+  assert.equal(chrome.postedToFrame.at(-1).enabled, true);
+});
+
+test("chrome client ignores annotation mode toggles after the session ends", async () => {
+  const chrome = await createChromeHarness();
+
+  chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
+  assert.equal(chrome.element("annotation")["aria-pressed"], "false");
+
+  chrome.sendFrameMessage({ type: "lavish:endSession" });
+  await flushPromises();
+  const afterEndPostCount = chrome.postedToFrame.length;
+
+  chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
+  chrome.sendFrameMessage({ type: "lavish:toggleAnnotationMode" });
+
+  assert.equal(chrome.element("annotation")["aria-pressed"], "false");
+  assert.equal(chrome.postedToFrame.length, afterEndPostCount);
+});
+
+function whiteboardFetch(url) {
+  if (url.includes("/whiteboard-channel")) return { ok: true };
+  if (url.includes("/mermaid-sources")) {
+    return { ok: true, json: async () => ({ sources: [{ index: 0, source: "flowchart TD; A-->B", hash: "hash" }] }) };
+  }
+  return { ok: true, json: async () => ({ whiteboard: null }) };
+}
+
+async function initializeInlineWhiteboard(chrome, token = "inline-channel") {
+  const whiteboard = chrome.createInlineWhiteboard();
+  chrome.sendInlineWhiteboardMessage(whiteboard, {
+    type: "lavish-whiteboard:ready",
+    diagramIndex: 0,
+    diagramId: "mermaid-1",
+    channelToken: token,
+  });
+  await flushPromises();
+  await flushPromises();
+  return whiteboard;
+}
+
+test("artifact relays cannot invoke whiteboard persistence", async () => {
+  const calls = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, init });
+      return whiteboardFetch(url);
+    },
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:whiteboardRelay",
+    diagramIndex: 0,
+    message: { type: "lavish-whiteboard:save", scene: { elements: [{ id: "forged" }] } },
+  });
+  await flushPromises();
+
+  assert.equal(calls.length, 0);
+  assert.equal(chrome.postedToFrame.length, 0);
+});
+
+test("unverified whiteboard frames cannot invoke whiteboard persistence", async () => {
+  const calls = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, init });
+      return { ok: false };
+    },
+  });
+  const whiteboard = chrome.createInlineWhiteboard();
+
+  chrome.sendInlineWhiteboardMessage(whiteboard, {
+    type: "lavish-whiteboard:ready",
+    diagramIndex: 0,
+    channelToken: "forged",
+  });
+  await flushPromises();
+  chrome.sendInlineWhiteboardMessage(whiteboard, {
+    type: "lavish-whiteboard:save",
+    diagramIndex: 0,
+    channelId: "forged",
+    scene: { elements: [{ id: "forged" }] },
+  });
+  await flushPromises();
+
+  assert.deepEqual(
+    calls.map((call) => call.url),
+    ["/api/abc/whiteboard-channel"],
+  );
+  assert.equal(whiteboard.posted.length, 0);
+});
+
+test("whiteboard fullscreen waits for the authenticated inline frame to flush", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: async (url) => whiteboardFetch(url) });
+  const inline = await initializeInlineWhiteboard(chrome);
+  const init = inline.posted.at(-1);
+  assert.equal(init.type, "lavish-whiteboard:init");
+  assert.equal(init.channelId, "inline-channel");
+
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:maximize",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+  });
+
+  const prepare = inline.posted.at(-1);
+  assert.equal(prepare.type, "lavish-whiteboard:prepareTeardown");
+  assert.equal(
+    chrome.postedToFrame.some((message) => message.type === "lavish:suspendWhiteboard"),
+    false,
+  );
+
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:teardownReady",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+    flushId: prepare.flushId,
+  });
+
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:suspendWhiteboard");
+  assert.match(chrome.element("whiteboardFrame").src, /^\/whiteboard-frame\?diagramIndex=0$/);
+});
+
+test("whiteboard close waits for the authenticated overlay frame to flush", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: async (url) => whiteboardFetch(url) });
+  const inline = await initializeInlineWhiteboard(chrome);
+
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:maximize",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+  });
+  const maximizePrepare = inline.posted.at(-1);
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:teardownReady",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+    flushId: maximizePrepare.flushId,
+  });
+  chrome.sendWhiteboardMessage({ type: "lavish-whiteboard:ready", diagramIndex: 0, channelToken: "overlay-channel" });
+  await flushPromises();
+  await flushPromises();
+
+  chrome.element("whiteboardClose").click();
+  const closePrepare = chrome.postedToWhiteboard.at(-1);
+  assert.equal(closePrepare.type, "lavish-whiteboard:prepareTeardown");
+  assert.equal(closePrepare.channelId, "overlay-channel");
+  assert.notEqual(chrome.element("whiteboardFrame").src, "about:blank");
+
+  chrome.sendWhiteboardMessage({
+    type: "lavish-whiteboard:teardownReady",
+    diagramIndex: 0,
+    channelId: "overlay-channel",
+    flushId: closePrepare.flushId,
+  });
+
+  assert.equal(chrome.element("whiteboardFrame").src, "about:blank");
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:resumeWhiteboard");
+});
+
+test("whiteboard fullscreen close accepts the resumed inline frame", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: async (url) => whiteboardFetch(url) });
+  const inline = await initializeInlineWhiteboard(chrome);
+
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:maximize",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+  });
+  const maximizePrepare = inline.posted.at(-1);
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:teardownReady",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+    flushId: maximizePrepare.flushId,
+  });
+  chrome.sendWhiteboardMessage({ type: "lavish-whiteboard:ready", diagramIndex: 0, channelToken: "overlay-channel" });
+  await flushPromises();
+  await flushPromises();
+
+  chrome.element("whiteboardClose").click();
+  const closePrepare = chrome.postedToWhiteboard.at(-1);
+  chrome.sendWhiteboardMessage({
+    type: "lavish-whiteboard:teardownReady",
+    diagramIndex: 0,
+    channelId: "overlay-channel",
+    flushId: closePrepare.flushId,
+  });
+
+  const resumed = chrome.createInlineWhiteboard();
+  chrome.sendInlineWhiteboardMessage(resumed, {
+    type: "lavish-whiteboard:ready",
+    diagramIndex: 0,
+    diagramId: "mermaid-1",
+    channelToken: "resumed-channel",
+  });
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(resumed.posted.at(-1).type, "lavish-whiteboard:init");
+  assert.equal(resumed.posted.at(-1).channelId, "resumed-channel");
+});
+
+test("artifact reload waits for inline whiteboards to flush", async () => {
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    fetchImpl: async (url) => whiteboardFetch(url),
+  });
+  const inline = await initializeInlineWhiteboard(chrome);
+  const initialLoadCount = chrome.srcLoads.length;
+
+  chrome.element("reloadArtifact").click();
+  const prepare = inline.posted.at(-1);
+  assert.equal(prepare.type, "lavish-whiteboard:prepareTeardown");
+  assert.equal(chrome.srcLoads.length, initialLoadCount);
+
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:teardownReady",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+    flushId: prepare.flushId,
+  });
+  await flushPromises();
+
+  assert.equal(chrome.srcLoads.length, initialLoadCount + 1);
+  assert.equal(chrome.element("artifact").src, "/artifact/abc/index.html");
+});
+
+test("server restart flushes an authenticated inline whiteboard before reloading", async () => {
+  let healthChecks = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (url === "/health") {
+        healthChecks += 1;
+        if (healthChecks === 1) throw new Error("server is restarting");
+        return { ok: true };
+      }
+      return whiteboardFetch(url);
+    },
+  });
+  const inline = await initializeInlineWhiteboard(chrome);
+
+  const restart = chrome.eventSource().listeners.get("chrome-reload")();
+  await flushPromises();
+  chrome.runTimers(100);
+  await flushPromises();
+
+  const flush = inline.posted.at(-1);
+  assert.equal(flush.type, "lavish-whiteboard:flush");
+  assert.equal(chrome.reloadCount(), 0);
+
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:flushComplete",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+    flushId: flush.flushId,
+    ok: true,
+  });
+  await restart;
+
+  assert.equal(chrome.reloadCount(), 1);
+});
+
+test("server restart flushes an authenticated overlay before reloading", async () => {
+  let healthChecks = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (url === "/health") {
+        healthChecks += 1;
+        if (healthChecks === 1) throw new Error("server is restarting");
+        return { ok: true };
+      }
+      return whiteboardFetch(url);
+    },
+  });
+  const inline = await initializeInlineWhiteboard(chrome);
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:maximize",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+  });
+  const teardown = inline.posted.at(-1);
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:teardownReady",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+    flushId: teardown.flushId,
+  });
+  chrome.sendWhiteboardMessage({ type: "lavish-whiteboard:ready", diagramIndex: 0, channelToken: "overlay-channel" });
+  await flushPromises();
+  await flushPromises();
+
+  const restart = chrome.eventSource().listeners.get("chrome-reload")();
+  await flushPromises();
+  chrome.runTimers(100);
+  await flushPromises();
+
+  const flush = chrome.postedToWhiteboard.at(-1);
+  assert.equal(flush.type, "lavish-whiteboard:flush");
+  assert.equal(chrome.reloadCount(), 0);
+
+  chrome.sendWhiteboardMessage({
+    type: "lavish-whiteboard:flushComplete",
+    diagramIndex: 0,
+    channelId: "overlay-channel",
+    flushId: flush.flushId,
+    ok: true,
+  });
+  await restart;
+
+  assert.equal(chrome.reloadCount(), 1);
+});
+
+test("server restart bounds the wait for a whiteboard flush", async () => {
+  let healthChecks = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (url === "/health") {
+        healthChecks += 1;
+        if (healthChecks === 1) throw new Error("server is restarting");
+        return { ok: true };
+      }
+      return whiteboardFetch(url);
+    },
+  });
+  const inline = await initializeInlineWhiteboard(chrome);
+
+  const restart = chrome.eventSource().listeners.get("chrome-reload")();
+  await flushPromises();
+  chrome.runTimers(100);
+  await flushPromises();
+
+  assert.equal(inline.posted.at(-1).type, "lavish-whiteboard:flush");
+  chrome.runTimers(1500);
+  await restart;
+
+  assert.equal(chrome.reloadCount(), 1);
+});
+
+test("whiteboard close stays responsive while overlay initialization is pending", async () => {
+  let delayOverlaySources = false;
+  /** @type {(() => void) | undefined} */
+  let releaseOverlaySources;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (delayOverlaySources && url.includes("/mermaid-sources")) {
+        await new Promise((resolve) => {
+          releaseOverlaySources = () => resolve();
+        });
+      }
+      return whiteboardFetch(url);
+    },
+  });
+  const inline = await initializeInlineWhiteboard(chrome);
+
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:maximize",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+  });
+  const maximizePrepare = inline.posted.at(-1);
+  chrome.sendInlineWhiteboardMessage(inline, {
+    type: "lavish-whiteboard:teardownReady",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+    flushId: maximizePrepare.flushId,
+  });
+
+  delayOverlaySources = true;
+  chrome.sendWhiteboardMessage({ type: "lavish-whiteboard:ready", diagramIndex: 0, channelToken: "overlay-channel" });
+  await flushPromises();
+  chrome.element("whiteboardClose").click();
+
+  assert.equal(chrome.element("whiteboardFrame").src, "about:blank");
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:resumeWhiteboard");
+  assert.equal(
+    chrome.postedToWhiteboard.some((message) => message.type === "lavish-whiteboard:prepareTeardown"),
+    false,
+  );
+
+  releaseOverlaySources?.();
+  await flushPromises();
 });

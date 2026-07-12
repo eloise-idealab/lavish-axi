@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { deriveLavishQueueKey, isNativeInteractiveControl } from "../src/artifact-sdk.js";
+import {
+  classifyHorizontalOverflow,
+  classifyVerticalOverflow,
+  deriveLavishQueueKey,
+  fragmentsSignificantlyOverlap,
+  isModeToggleHotkeyEvent,
+  isNativeInteractiveControl,
+  resolveVisibleSpillCandidates,
+} from "../src/artifact-sdk.js";
 
 function node(tag, attrs = {}, children = []) {
   const el = {
@@ -23,6 +31,14 @@ function node(tag, attrs = {}, children = []) {
     },
     matches(selector) {
       return matchesSelectorList(this, selector);
+    },
+    contains(other) {
+      let current = other;
+      while (current) {
+        if (current === this) return true;
+        current = current.parentElement;
+      }
+      return false;
     },
   };
   if (attrs.id) el.id = attrs.id;
@@ -147,4 +163,154 @@ test("deriveLavishQueueKey keys named selects as fields", () => {
   node("form", { id: "deploy" }, [select]);
 
   assert.equal(deriveLavishQueueKey(select), "field:form:deploy:region");
+});
+
+test("fragmentsSignificantlyOverlap ignores the reflow gap in a wrapped inline phrase's bounding box", () => {
+  // A <strong> that wraps across two lines reports one getClientRects() rect per line: the end
+  // of line 1 near the right edge, then the continuation at the left edge of line 2. The union
+  // bounding box of those two rects spans the full width between them - a naive bounding-box
+  // check would treat anything sitting in that phantom middle area as overlapping, even though
+  // nothing is actually rendered there.
+  const wrappedFragments = [
+    { left: 620, right: 900, top: 100, bottom: 120, width: 280, height: 20 },
+    { left: 0, right: 260, top: 120, bottom: 140, width: 260, height: 20 },
+  ];
+  const siblingInThePhantomGap = [{ left: 300, right: 600, top: 100, bottom: 120, width: 300, height: 20 }];
+
+  assert.equal(fragmentsSignificantlyOverlap(wrappedFragments, siblingInThePhantomGap), false);
+});
+
+test("fragmentsSignificantlyOverlap flags real pixel intersection between rendered fragments", () => {
+  const elFragments = [{ left: 0, right: 100, top: 0, bottom: 20, width: 100, height: 20 }];
+  const otherFragments = [{ left: 40, right: 140, top: 5, bottom: 25, width: 100, height: 20 }];
+
+  assert.equal(fragmentsSignificantlyOverlap(elFragments, otherFragments), true);
+});
+
+test("fragmentsSignificantlyOverlap ignores sub-threshold seam overlap between adjacent lines", () => {
+  const elFragments = [{ left: 0, right: 200, top: 0, bottom: 20, width: 200, height: 20 }];
+  const barelyTouchingFragments = [{ left: 199, right: 210, top: 0, bottom: 20, width: 11, height: 20 }];
+
+  assert.equal(fragmentsSignificantlyOverlap(elFragments, barelyTouchingFragments), false);
+});
+
+test("classifyVerticalOverflow flags a fixed-height badge whose wrapped label spills out with default overflow", () => {
+  // DaisyUI-style badges/pills rarely set overflow-y at all, so it stays at its default
+  // "visible" - the wrapped second word isn't clipped, it just spills outside the pill shape.
+  const finding = classifyVerticalOverflow({
+    scrollHeight: 40,
+    clientHeight: 24,
+    overflowY: "visible",
+    hasText: true,
+    isTruncated: false,
+  });
+
+  assert.deepEqual(finding, { overflowPx: 16, kind: "clipped-text", clips: false });
+});
+
+test("classifyVerticalOverflow marks hidden/clip overflow-y as a hard clip", () => {
+  const finding = classifyVerticalOverflow({
+    scrollHeight: 40,
+    clientHeight: 24,
+    overflowY: "hidden",
+    hasText: true,
+    isTruncated: false,
+  });
+
+  assert.deepEqual(finding, { overflowPx: 16, kind: "clipped-text", clips: true });
+});
+
+test("classifyVerticalOverflow ignores intentionally scrollable containers", () => {
+  const finding = classifyVerticalOverflow({
+    scrollHeight: 400,
+    clientHeight: 200,
+    overflowY: "auto",
+    hasText: true,
+    isTruncated: false,
+  });
+
+  assert.equal(finding, null);
+});
+
+test("classifyVerticalOverflow ignores boxes that simply grow to fit their content", () => {
+  const finding = classifyVerticalOverflow({
+    scrollHeight: 100,
+    clientHeight: 100,
+    overflowY: "visible",
+    hasText: true,
+    isTruncated: false,
+  });
+
+  assert.equal(finding, null);
+});
+
+test("resolveVisibleSpillCandidates keeps the deepest candidate for one bubbled spill", () => {
+  const badge = node("span");
+  const row = node("div", {}, [badge]);
+  const section = node("section", {}, [row]);
+  const candidates = [
+    { el: section, selector: "section", overflowPx: 16, spillBottom: 140 },
+    { el: row, selector: ".row", overflowPx: 16, spillBottom: 140 },
+    { el: badge, selector: ".badge", overflowPx: 16, spillBottom: 140 },
+  ];
+
+  assert.deepEqual(
+    resolveVisibleSpillCandidates(candidates).map((candidate) => candidate.selector),
+    [".badge"],
+  );
+});
+
+test("resolveVisibleSpillCandidates preserves ancestors with independent overflow", () => {
+  const badge = node("span");
+  const section = node("section", {}, [badge]);
+  const candidates = [
+    { el: section, selector: "section", overflowPx: 48, spillBottom: 220 },
+    { el: badge, selector: ".badge", overflowPx: 16, spillBottom: 140 },
+  ];
+
+  assert.deepEqual(
+    resolveVisibleSpillCandidates(candidates).map((candidate) => candidate.selector),
+    ["section", ".badge"],
+  );
+});
+
+test("classifyHorizontalOverflow still distinguishes clipped text from generic scroll overflow", () => {
+  const clipped = classifyHorizontalOverflow({
+    scrollWidth: 300,
+    clientWidth: 200,
+    overflowX: "hidden",
+    hasText: true,
+    isTruncated: false,
+  });
+  assert.deepEqual(clipped, { overflowPx: 100, kind: "clipped-text" });
+
+  const genericScroll = classifyHorizontalOverflow({
+    scrollWidth: 300,
+    clientWidth: 200,
+    overflowX: "visible",
+    hasText: true,
+    isTruncated: false,
+  });
+  assert.deepEqual(genericScroll, { overflowPx: 100, kind: "element-scroll-overflow" });
+});
+
+test("isModeToggleHotkeyEvent matches Cmd/Ctrl+I regardless of case", () => {
+  assert.equal(isModeToggleHotkeyEvent({ key: "i", metaKey: true }), true);
+  assert.equal(isModeToggleHotkeyEvent({ key: "I", ctrlKey: true }), true);
+  assert.equal(isModeToggleHotkeyEvent({ key: "i", metaKey: true, ctrlKey: true }), true);
+});
+
+test("isModeToggleHotkeyEvent requires a modifier so plain typing is unaffected", () => {
+  assert.equal(isModeToggleHotkeyEvent({ key: "i" }), false);
+  assert.equal(isModeToggleHotkeyEvent({ key: "i", shiftKey: true }), false);
+});
+
+test("isModeToggleHotkeyEvent rejects extra shift or alt modifiers", () => {
+  assert.equal(isModeToggleHotkeyEvent({ key: "i", ctrlKey: true, shiftKey: true }), false);
+  assert.equal(isModeToggleHotkeyEvent({ key: "i", metaKey: true, altKey: true }), false);
+});
+
+test("isModeToggleHotkeyEvent ignores other keys even with a modifier held", () => {
+  assert.equal(isModeToggleHotkeyEvent({ key: "e", metaKey: true }), false);
+  assert.equal(isModeToggleHotkeyEvent({ key: "Enter", metaKey: true }), false);
 });

@@ -4,19 +4,30 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { AxiError } from "axi-sdk-js";
 
+process.env.LAVISH_AXI_HOST = "127.0.0.1";
+process.env.LAVISH_AXI_LINK_HOST = "127.0.0.1";
+
 import {
   collapseHomeDirectory,
+  computeCopilotCliHookUpdate,
+  createCopilotCliAmbientContextScript,
+  createCopilotCliSessionStartHook,
   createDesignOutput,
+  createExportOutput,
   createHomeOutput,
   createOpenOutput,
   createPollOutput,
   createPlaybookOutput,
   createServerSpawnOptions,
+  createShareOutput,
+  createUserEndedOpenOutput,
+  detectInvokingAgent,
   drainSseBuffer,
   fetchJson,
   getCommandHelp,
@@ -24,6 +35,7 @@ import {
   pollInterruptedText,
   pollWaitBannerText,
   pollWaitTickText,
+  resolveCopilotHookDir,
   resolveHookHomeDir,
   resolveServerEntry,
   shutdownServerOnPort,
@@ -37,7 +49,14 @@ import {
   telemetryCommandName,
   VERSION,
 } from "../src/cli.js";
+import { DESIGN_PRIORITY_RULE, DESIGN_SYSTEM_HINT } from "../src/design-reference.js";
 import { serve } from "../src/server.js";
+
+function setupHooksEnv(homeDir, stateDir) {
+  // eslint-disable-next-line no-unused-vars
+  const { COPILOT_HOME, ...env } = process.env;
+  return { ...env, HOME: homeDir, LAVISH_AXI_STATE_DIR: stateDir };
+}
 
 test("CLI version tracks package.json so release-please bumps reach the published binary", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
@@ -56,8 +75,11 @@ test("home output teaches agents when and how to use Lavish Editor", () => {
   assert.equal("use_cases" in output, false);
   assert.equal("example_use_cases" in output, false);
   assert.equal("artifact_guidance" in output, false);
-  assert.ok(output.visual_guidance.length <= 4);
+  assert.ok(output.visual_guidance.length <= 5);
   assert.ok(output.visual_guidance.some((item) => item.includes("visual hierarchy")));
+  assert.ok(
+    output.visual_guidance.some((item) => /screenshot/i.test(item) && /embed/i.test(item) && /prose/i.test(item)),
+  );
   assert.ok(output.visual_guidance.some((item) => item.includes("sections, cards, tables")));
   assert.ok(output.visual_guidance.some((item) => item.includes("horizontal overflow")));
   assert.ok(output.visual_guidance.some((item) => item.includes("minmax(0, 1fr)")));
@@ -76,27 +98,33 @@ test("home output teaches agents when and how to use Lavish Editor", () => {
   assert.ok(output.help.some((item) => item.includes("MUST open each matching playbook")));
   assert.ok(output.help.some((item) => item.includes("reference other filesystem assets")));
   assert.ok(output.help.some((item) => item.includes("same directory as the HTML file")));
-  assert.ok(output.help.some((item) => item.includes("does not auto-inject")));
-  assert.ok(output.help.some((item) => item.includes("portable")));
-  assert.ok(output.help.some((item) => item.includes("Tailwind CSS browser runtime v4")));
-  assert.ok(output.help.some((item) => item.includes("lavish-axi design")));
-  assert.ok(output.help.some((item) => /prefer.*CDN snippet.*hand-writing styles/i.test(item)));
-  assert.ok(output.help.some((item) => /unless.*explicitly instructed/i.test(item)));
-  assert.ok(output.help.some((item) => /priority order/i.test(item)));
-  assert.ok(output.help.some((item) => /subject or product/i.test(item)));
-  assert.ok(output.help.some((item) => /current working directory/i.test(item)));
-  assert.ok(output.help.some((item) => /before writing any html/i.test(item)));
-  assert.ok(output.help.some((item) => /inspect the project the artifact is about/i.test(item)));
-  assert.ok(output.help.some((item) => /previews, proposes, or mocks/i.test(item)));
-  assert.ok(output.help.some((item) => /app's own design system/i.test(item)));
-  assert.ok(output.help.some((item) => /css variables|design tokens/i.test(item)));
-  assert.ok(output.help.some((item) => /component library/i.test(item)));
-  assert.ok(output.help.some((item) => /only when both steps come up empty/i.test(item)));
-  assert.ok(output.help.some((item) => /state which of the three design sources/i.test(item)));
-  assert.ok(!output.help.some((item) => /inspect the current project/i.test(item)));
+  assert.ok(output.help.includes(DESIGN_SYSTEM_HINT), "home help carries the single-sourced design rule verbatim");
   assert.ok(!output.help.some((item) => item.includes('<meta name="lavish-design" content="off">')));
   assert.ok(!output.help.some((item) => item.includes("Known IDs")));
   assert.ok(output.help.some((item) => item.includes("technical plan")));
+});
+
+test("the design-priority rule is single-sourced and keeps its three-step semantics", () => {
+  // Keyword-level checks on the one owner constant; every surface that needs the rule
+  // embeds DESIGN_PRIORITY_RULE, so wording changes happen here and nowhere else.
+  assert.match(DESIGN_PRIORITY_RULE, /strict priority order/);
+  assert.match(DESIGN_PRIORITY_RULE, /\(1\)[\s\S]*\(2\)[\s\S]*\(3\)/);
+  assert.match(DESIGN_PRIORITY_RULE, /user asked for a specific look or named design system/);
+  assert.match(DESIGN_PRIORITY_RULE, /project the artifact is about/);
+  assert.match(DESIGN_PRIORITY_RULE, /current working directory/);
+  assert.match(DESIGN_PRIORITY_RULE, /previews, proposes, or mocks/);
+  assert.match(DESIGN_PRIORITY_RULE, /app's own design system/);
+  assert.match(DESIGN_PRIORITY_RULE, /Tailwind CSS browser runtime v4 \+ DaisyUI v5/);
+  assert.match(DESIGN_PRIORITY_RULE, /only when both steps come up empty/);
+  assert.match(DESIGN_PRIORITY_RULE, /hand-writing styles/);
+  assert.match(DESIGN_PRIORITY_RULE, /unless explicitly instructed/);
+  assert.doesNotMatch(DESIGN_PRIORITY_RULE, /inspect the current project/i);
+
+  assert.ok(DESIGN_SYSTEM_HINT.includes(DESIGN_PRIORITY_RULE), "the home/skill hint embeds the rule");
+  assert.match(DESIGN_SYSTEM_HINT, /does not auto-inject/);
+  assert.match(DESIGN_SYSTEM_HINT, /portable/);
+  assert.match(DESIGN_SYSTEM_HINT, /lavish-axi design/);
+  assert.match(DESIGN_SYSTEM_HINT, /state which of the three design sources/);
 });
 
 test("home output warns agents that poll is a long poll they must not kill", () => {
@@ -107,10 +135,42 @@ test("home output warns agents that poll is a long poll they must not kill", () 
   assert.match(pollHelp, /long-poll/);
   assert.match(pollHelp, /stays silent/);
   assert.match(pollHelp, /never kill it/);
-  assert.match(pollHelp, /background task/);
+  assert.match(pollHelp, /agent harness/);
+  assert.match(pollHelp, /foreground command may run/);
+  assert.match(pollHelp, /run the poll as a background task/);
+  assert.doesNotMatch(pollHelp, /Codex/);
+  assert.doesNotMatch(pollHelp, /do not hide the poll in a background task/);
   assert.match(pollHelp, /re-run/);
   assert.match(pollHelp, /queued feedback is never lost/);
   assert.doesNotMatch(pollHelp, /above 10 minutes/);
+});
+
+test("home output tailors poll guidance when invoked under Codex", () => {
+  const output = createHomeOutput({ bin: "lavish-axi", sessions: [], agent: "codex" });
+  const pollHelp = output.help.find((item) => item.includes("lavish-axi poll <html-file>"));
+
+  assert.match(pollHelp, /Codex detected/);
+  assert.match(pollHelp, /do not hide the poll in a background task/);
+  assert.match(pollHelp, /keep the poll attached to the active turn/);
+  assert.doesNotMatch(pollHelp, /agent harness limits/);
+});
+
+test("home output keeps static skill poll guidance agent-neutral", () => {
+  const output = createHomeOutput({ bin: "lavish-axi", sessions: [], agent: "static" });
+  const pollHelp = output.help.find((item) => item.includes("lavish-axi poll <html-file>"));
+
+  assert.doesNotMatch(pollHelp, /keep the poll attached to the active turn/i);
+  assert.doesNotMatch(pollHelp, /run the poll as a background task/);
+  assert.doesNotMatch(pollHelp, /Codex detected/);
+  assert.match(pollHelp, /queued feedback is never lost/);
+});
+
+test("invoking agent detection recognizes Codex runtime markers only", () => {
+  assert.equal(detectInvokingAgent({ PATH: "/bin", CODEX_SANDBOX: "seatbelt" }), "codex");
+  assert.equal(detectInvokingAgent({ PATH: "/bin", CODEX_THREAD_ID: "thread" }), "codex");
+  assert.equal(detectInvokingAgent({ PATH: "/bin", CODEX_HOME: "/tmp/codex" }), "generic");
+  assert.equal(detectInvokingAgent({ PATH: "/bin", CODEX_EXPERIMENTAL_FEATURE: "1" }), "generic");
+  assert.equal(detectInvokingAgent({ PATH: "/bin" }), "generic");
 });
 
 test("top-level help renders static home output without dynamic sessions", async () => {
@@ -133,16 +193,7 @@ test("top-level help renders static home output without dynamic sessions", async
     assert.match(result.stdout, /same directory as the HTML file/);
     assert.match(result.stdout, /Tailwind CSS browser runtime v4/);
     assert.match(result.stdout, /lavish-axi design/);
-    assert.match(result.stdout, /does not auto-inject/);
-    assert.match(result.stdout, /prefer.*CDN snippet.*hand-writing styles/i);
-    assert.match(result.stdout, /unless.*explicitly instructed/i);
-    assert.match(result.stdout, /priority order/i);
-    assert.match(result.stdout, /subject or product/i);
-    assert.match(result.stdout, /current working directory/i);
-    assert.match(result.stdout, /inspect the project the artifact is about/i);
-    assert.match(result.stdout, /previews, proposes, or mocks/i);
-    assert.match(result.stdout, /app's own design system/i);
-    assert.doesNotMatch(result.stdout, /inspect the current project/i);
+    assert.match(result.stdout, /strict priority order/);
     assert.match(result.stdout, /never kill it/);
     assert.match(result.stdout, /queued feedback is never lost/);
     assert.doesNotMatch(result.stdout, /above 10 minutes/);
@@ -163,20 +214,10 @@ test("design output prints copy-pasteable CDN URLs so agents can opt in to Daisy
     output.playbook_router.playbooks.find((playbook) => playbook.id === "diagram")?.use_when,
     "Map relationships, flows, state, and architecture",
   );
+  assert.ok(output.design.summary.includes(DESIGN_PRIORITY_RULE), "design summary embeds the single-sourced rule");
   assert.match(output.design.summary, /does not auto-inject/);
-  assert.match(output.design.summary, /Tailwind CSS browser runtime v4/);
-  assert.match(output.design.summary, /DaisyUI v5/);
-  assert.match(output.design.summary, /prefer.*CDN snippet.*hand-writing styles/i);
-  assert.match(output.design.summary, /unless.*explicitly instructed/i);
-  assert.match(output.design.summary, /priority order/i);
-  assert.match(output.design.summary, /subject or product/i);
-  assert.match(output.design.summary, /current working directory/i);
-  assert.match(output.design.summary, /previews, proposes, or mocks/i);
-  assert.match(output.design.summary, /app's own design system/i);
-  assert.doesNotMatch(output.design.summary, /inspect the current project/i);
   assert.match(output.design.summary, /^Use this .*fallback only if/i);
   assert.match(output.design.summary, /no design direction/i);
-  assert.match(output.design.summary, /inspect/i);
   assert.match(output.design.summary, /check first/i);
   assert.match(output.design.cdn_snippet, /cdn\.jsdelivr\.net\/npm\/daisyui@/);
   assert.match(output.design.cdn_snippet, /cdn\.jsdelivr\.net\/npm\/daisyui@.*\/themes\.css/);
@@ -203,7 +244,6 @@ test("design output prints copy-pasteable CDN URLs so agents can opt in to Daisy
   assert.match(output.diagram_tooling.use_when, /hand-built div\/flexbox boxes/);
   assert.match(output.diagram_tooling.mermaid_cdn_snippet, /cdn\.jsdelivr\.net\/npm\/mermaid@\d+\.\d+\.\d+/);
   assert.match(output.diagram_tooling.mermaid_cdn_snippet, /mermaid\.initialize/);
-  assert.match(output.diagram_tooling.mermaid_cdn_snippet, /startOnLoad: true/);
   assert.match(
     output.diagram_tooling.cdn_urls.mermaid,
     /^https:\/\/cdn\.jsdelivr\.net\/npm\/mermaid@\d+\.\d+\.\d+\/dist\/mermaid\.esm\.min\.mjs$/,
@@ -263,6 +303,232 @@ test("diagram playbook names the hand-built flow anti-pattern", () => {
   assert.ok(output.playbook.pitfalls.some((item) => /hand-build boxes-and-arrows/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /div\/flexbox/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /does not auto-route edges/i.test(item)));
+});
+
+test("diagram playbook tells agents to keep Mermaid theming in sync with the page theme", () => {
+  const output = createPlaybookOutput(["diagram"]);
+
+  assert.ok(
+    output.playbook.design_rules.some(
+      (item) => /mermaid/i.test(item) && /theme/i.test(item) && /re-render/i.test(item),
+    ),
+    "diagram playbook must tell agents to theme Mermaid to the page and re-render on theme change",
+  );
+});
+
+test("design output emits a theme-aware Mermaid init that re-renders on page-theme change", () => {
+  const snippet = createDesignOutput().diagram_tooling.mermaid_cdn_snippet;
+
+  // The old bug: a single hardcoded Mermaid theme that ignores the page theme.
+  assert.doesNotMatch(snippet, /theme:\s*["']base["']/);
+
+  // It must choose the Mermaid theme from the page's effective light/dark
+  // appearance, covering both a data-theme toggle and the OS preference.
+  assert.match(snippet, /prefers-color-scheme:\s*dark/);
+  assert.match(snippet, /["']dark["']/);
+  assert.match(snippet, /["']default["']/);
+  assert.match(snippet, /backgroundColor/);
+
+  // Mermaid does not restyle an already-rendered SVG, so the snippet must
+  // re-render: it drives rendering itself and reacts to theme changes.
+  assert.match(snippet, /startOnLoad:\s*false/);
+  assert.match(snippet, /mermaid\.run/);
+  assert.match(snippet, /MutationObserver/);
+  assert.match(snippet, /data-theme/);
+  assert.match(snippet, /document\.addEventListener\(["']change["'],\s*queueRender,\s*true\)/);
+  assert.match(snippet, /document\.addEventListener\(\s*["']transitionend["']/);
+  assert.match(snippet, /background-color/);
+  assert.match(snippet, /function compositeRgba/);
+  assert.match(snippet, /colorScheme/);
+  assert.match(snippet, /addEventListener\(["']change["']/);
+});
+
+test("theme-aware Mermaid snippet serializes rapid theme-change renders", async () => {
+  const snippet = createDesignOutput()
+    .diagram_tooling.mermaid_cdn_snippet.replace(/^<script type="module">\n/, "")
+    .replace(/\n<\/script>$/, "")
+    .replace(/^\s*import mermaid from "[^"]+";\n/m, "");
+  let dark = false;
+  let observedThemeMutations = false;
+  const observedThemeTargets = [];
+  const documentListeners = new Map();
+  const initializedThemes = [];
+  const mediaListeners = [];
+  const pendingRenders = [];
+  const loggedRenderErrors = [];
+  let nextRenderError;
+  let activeRenders = 0;
+  let maxActiveRenders = 0;
+  let bodyColor = "white";
+  let rootColor = "white";
+  let rootColorScheme = "normal";
+  const paint = {
+    color: "",
+    clearRect() {},
+    set fillStyle(color) {
+      this.color = color;
+    },
+    fillRect() {},
+    getImageData() {
+      const colors = {
+        black: [0, 0, 0, 255],
+        transparent: [0, 0, 0, 0],
+        white: [255, 255, 255, 255],
+        "white-40": [255, 255, 255, 102],
+      };
+      return { data: colors[this.color] };
+    },
+  };
+  const diagram = {
+    textContent: "flowchart TD\\n  A --> B",
+    removeAttribute() {},
+  };
+  const document = {
+    body: { id: "body" },
+    documentElement: { id: "root" },
+    readyState: "complete",
+    createElement() {
+      return { getContext: () => paint };
+    },
+    querySelectorAll() {
+      return [diagram];
+    },
+    addEventListener(type, callback, capture) {
+      documentListeners.set(type, { callback, capture });
+    },
+  };
+  const darkQuery = {
+    get matches() {
+      return dark;
+    },
+    addEventListener(type, callback) {
+      assert.equal(type, "change");
+      mediaListeners.push(callback);
+    },
+  };
+  const window = {
+    matchMedia() {
+      return darkQuery;
+    },
+    addEventListener() {
+      assert.fail("the snippet should render immediately after document load");
+    },
+  };
+  class TestMutationObserver {
+    constructor() {
+      observedThemeMutations = true;
+    }
+
+    observe(target) {
+      observedThemeTargets.push(target);
+    }
+  }
+  const mermaid = {
+    initialize({ theme }) {
+      initializedThemes.push(theme);
+    },
+    run() {
+      activeRenders += 1;
+      maxActiveRenders = Math.max(maxActiveRenders, activeRenders);
+      if (nextRenderError) {
+        const error = nextRenderError;
+        nextRenderError = undefined;
+        activeRenders -= 1;
+        return Promise.reject(error);
+      }
+      return new Promise((resolve) => {
+        pendingRenders.push(() => {
+          activeRenders -= 1;
+          resolve();
+        });
+      });
+    },
+  };
+  function finishNextRender() {
+    const finish = pendingRenders.shift();
+    if (!finish) throw new Error("expected a pending Mermaid render");
+    finish();
+  }
+
+  new Function("mermaid", "window", "document", "MutationObserver", "getComputedStyle", "console", snippet)(
+    mermaid,
+    window,
+    document,
+    TestMutationObserver,
+    (element) => ({
+      backgroundColor: element === document.body ? bodyColor : rootColor,
+      colorScheme: element === document.documentElement ? rootColorScheme : "normal",
+    }),
+    { error: (...args) => loggedRenderErrors.push(args) },
+  );
+
+  assert.equal(mediaListeners.length, 1);
+  assert.equal(observedThemeMutations, true);
+  assert.deepEqual(observedThemeTargets, [document.documentElement, document.body]);
+  const changeListener = documentListeners.get("change");
+  assert.equal(typeof changeListener?.callback, "function");
+  assert.equal(changeListener?.capture, true);
+  const transitionListener = documentListeners.get("transitionend");
+  assert.equal(typeof transitionListener?.callback, "function");
+  assert.equal(transitionListener?.capture, true);
+  assert.deepEqual(initializedThemes, ["default"]);
+  bodyColor = "white-40";
+  rootColor = "black";
+  transitionListener.callback({ propertyName: "color" });
+  assert.deepEqual(initializedThemes, ["default"]);
+  transitionListener.callback({ propertyName: "background-color" });
+  assert.equal(maxActiveRenders, 1);
+  assert.deepEqual(initializedThemes, ["default"]);
+
+  finishNextRender();
+  await Promise.resolve();
+  assert.deepEqual(initializedThemes, ["default", "dark"]);
+  assert.equal(maxActiveRenders, 1);
+
+  finishNextRender();
+  await Promise.resolve();
+  assert.equal(activeRenders, 0);
+  assert.equal(initializedThemes.filter((entry) => entry === "dark").length, 1);
+
+  bodyColor = "transparent";
+  rootColor = "transparent";
+  rootColorScheme = "light";
+  changeListener.callback();
+  assert.deepEqual(initializedThemes, ["default", "dark", "default"]);
+  finishNextRender();
+  await Promise.resolve();
+
+  rootColorScheme = "dark";
+  transitionListener.callback({ propertyName: "background-color" });
+  assert.deepEqual(initializedThemes, ["default", "dark", "default", "dark"]);
+  finishNextRender();
+  await Promise.resolve();
+
+  const renderError = new Error("invalid Mermaid syntax");
+  nextRenderError = renderError;
+  rootColorScheme = "light";
+  transitionListener.callback({ propertyName: "background-color" });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(loggedRenderErrors, [["Mermaid diagram render failed:", renderError]]);
+
+  changeListener.callback();
+  assert.equal(activeRenders, 1);
+  finishNextRender();
+  await Promise.resolve();
+});
+
+test("Mermaid after evidence embeds the shipped theme-aware snippet", async () => {
+  const evidence = await readFile(new URL("../task-evidence/mermaid-theme/after.html", import.meta.url), "utf8");
+  const start = evidence.indexOf('    <script type="module">');
+  const closingScript = evidence.indexOf("    </script>", start);
+
+  assert.notEqual(start, -1);
+  assert.notEqual(closingScript, -1);
+  assert.equal(
+    evidence.slice(start, closingScript + "    </script>".length).replace(/^ {4}/gm, ""),
+    createDesignOutput().diagram_tooling.mermaid_cdn_snippet,
+  );
 });
 
 test("playbook detail output returns focused Lavish-native guidance", () => {
@@ -341,20 +607,354 @@ test("open output keeps the user URL in session data and next_step focused on po
   assert.equal(output.session.file, "/tmp/artifact.html");
   assert.equal(output.session.url, "http://localhost:4387/session/abc123");
   assert.equal(output.session.status, "opened");
-  assert.equal(typeof output.next_step, "string");
+  // Keyword-level lock on the load-bearing semantics of this agent-facing string:
+  // poll now (not the user-facing URL), never kill the poll, no --timeout-ms, and the
+  // reopen etiquette. Sentence-level phrasing is free to change without touching this test.
   assert.doesNotMatch(output.next_step, /Tell the user/i);
   assert.doesNotMatch(output.next_step, /http:\/\/localhost:4387\/session\/abc123/);
   assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
   assert.match(output.next_step, /lavish-axi poll \/tmp\/artifact\.html/);
-  assert.match(output.next_step, /long-polls until/);
   assert.match(output.next_step, /layout_warnings/);
-  assert.match(output.next_step, /in-iframe layout audit/);
-  assert.match(output.next_step, /stays silent/);
   assert.match(output.next_step, /never kill it/);
-  assert.match(output.next_step, /background task/);
+  assert.match(output.next_step, /agent harness/);
+  assert.match(output.next_step, /foreground command may run/);
+  assert.match(output.next_step, /run the poll as a background task/);
+  assert.doesNotMatch(output.next_step, /Codex/);
+  assert.doesNotMatch(output.next_step, /do not hide the poll in a background task/);
   assert.match(output.next_step, /queued feedback is never lost/);
   assert.match(output.next_step, /Do not pass --timeout-ms/);
-  assert.doesNotMatch(output.next_step, /above 10 minutes/);
+  assert.match(output.next_step, /If the user ends the session, stop polling and do not reopen it/);
+  assert.match(output.next_step, /--reopen/);
+});
+
+test("open output steers Codex away from background polling", () => {
+  const output = createOpenOutput({
+    file: "/tmp/artifact.html",
+    url: "http://localhost:4387/session/abc123",
+    status: "opened",
+    agent: "codex",
+  });
+
+  assert.match(output.next_step, /Codex detected/);
+  assert.match(output.next_step, /do not hide the poll in a background task/);
+  assert.match(output.next_step, /keep the poll attached to the active turn/);
+  assert.doesNotMatch(output.next_step, /agent harness limits/);
+});
+
+test("a user-ended open refuses with a status agents can branch on, not a URL to open", () => {
+  const output = createUserEndedOpenOutput({
+    file: "/tmp/artifact.html",
+    url: "http://localhost:4387/session/abc123",
+  });
+
+  assert.equal(output.session.file, "/tmp/artifact.html");
+  assert.equal(output.session.status, "user-ended");
+  assert.match(output.next_step, /user explicitly ended this Lavish Editor session from the browser/);
+  assert.match(output.next_step, /did not reopen it/);
+  assert.match(output.next_step, /Do not reopen unless the user asks for further review/);
+  assert.match(output.next_step, /lavish-axi \/tmp\/artifact\.html --reopen/);
+});
+
+test("export output reports the written file and reassures it needs no server", () => {
+  const output = createExportOutput({
+    source: "/tmp/report.html",
+    output: "/tmp/report.export.html",
+    html: "<html></html>",
+    warnings: [],
+  });
+
+  assert.equal(output.export.source, "/tmp/report.html");
+  assert.equal(output.export.output, "/tmp/report.export.html");
+  assert.equal(output.export.unresolved_local_assets, 0);
+  assert.equal(output.export.bytes, Buffer.byteLength("<html></html>"));
+  assert.match(output.next_step, /no Lavish server/);
+  assert.match(output.next_step, /remote CDN\/font references are left as links/);
+});
+
+test("export output surfaces local assets that could not be inlined", () => {
+  const output = createExportOutput({
+    source: "/tmp/report.html",
+    output: "/tmp/report.export.html",
+    html: "<html></html>",
+    warnings: [{ kind: "load-failed", ref: "./missing.png" }],
+  });
+
+  assert.deepEqual(output.unresolved_local_assets, [{ kind: "load-failed", ref: "./missing.png" }]);
+  assert.match(output.next_step, /LOCAL assets could not be inlined/);
+});
+
+test("export output counts active srcdoc refs as unresolved assets", () => {
+  const output = createExportOutput({
+    source: "/tmp/report.html",
+    output: "/tmp/report.export.html",
+    html: "<html></html>",
+    warnings: [{ kind: "srcdoc-resource", ref: "local.png" }],
+  });
+
+  assert.equal(output.export.unresolved_local_assets, 1);
+  assert.deepEqual(output.unresolved_local_assets, [{ kind: "srcdoc-resource", ref: "local.png" }]);
+  assert.equal("notices" in output, false);
+});
+
+test("export output separates unresolved assets from notices", () => {
+  const output = createExportOutput({
+    source: "/tmp/report.html",
+    output: "/tmp/report.export.html",
+    html: "<html></html>",
+    warnings: [
+      { kind: "load-failed", ref: "./missing.png", reason: "ENOENT" },
+      { kind: "file-url-redacted", ref: "file:///Users/kun/secret.png" },
+      { kind: "csp-meta", ref: "script-src 'self'" },
+    ],
+  });
+
+  assert.equal(output.export.unresolved_local_assets, 1);
+  assert.equal(output.export.notices, 2);
+  assert.deepEqual(output.unresolved_local_assets, [{ kind: "load-failed", ref: "./missing.png", reason: "ENOENT" }]);
+  assert.deepEqual(output.notices, [
+    { kind: "file-url-redacted", ref: "file:///Users/kun/secret.png" },
+    { kind: "csp-meta", ref: "script-src 'self'" },
+  ]);
+  assert.equal(output.warnings.length, 3);
+});
+
+test("export command writes a portable HTML file next to the artifact", async () => {
+  const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-export-test-`);
+  const artifact = `${dir}/report.html`;
+  await writeFile(`${dir}/theme.css`, ".btn{color:rebeccapurple}", "utf8");
+  await writeFile(
+    artifact,
+    '<!doctype html><html><head><link rel="stylesheet" href="theme.css">' +
+      '<link rel="stylesheet" href="https://cdn.example/app.css"></head><body><h1>Hi</h1></body></html>',
+    "utf8",
+  );
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "export", artifact],
+      {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: { ...process.env, LAVISH_AXI_STATE_DIR: dir, LAVISH_AXI_TELEMETRY: "0" },
+        encoding: "utf8",
+      },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /report\.export\.html/);
+    const exported = await readFile(`${dir}/report.export.html`, "utf8");
+    // local stylesheet inlined; remote stylesheet left as a link; SDK stripped
+    assert.match(exported, /<style>\.btn\{color:rebeccapurple\}<\/style>/);
+    assert.match(exported, /<link rel="stylesheet" href="https:\/\/cdn\.example\/app\.css">/);
+    assert.doesNotMatch(exported, /sdk\.js/);
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("export command treats --out value as an option operand, not the source file", async () => {
+  const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-export-test-`);
+  const artifact = `${dir}/report.html`;
+  const output = `${dir}/custom.html`;
+  await writeFile(artifact, "<!doctype html><html><body><h1>Hi</h1></body></html>", "utf8");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "export", "--out", output, artifact],
+      {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: { ...process.env, LAVISH_AXI_STATE_DIR: dir, LAVISH_AXI_TELEMETRY: "0" },
+        encoding: "utf8",
+      },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /custom\.html/);
+    assert.match(await readFile(output, "utf8"), /<h1>Hi<\/h1>/);
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("share output reports the public url and the secret update key", () => {
+  const output = createShareOutput({
+    source: "/tmp/report.html",
+    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
+    warnings: [],
+  });
+
+  assert.equal(output.share.source, "/tmp/report.html");
+  assert.equal(output.share.url, "https://x.ht-ml.app/");
+  assert.equal(output.share.update_key, "uk_secret");
+  assert.equal(output.share.public, true);
+  assert.equal(output.share.visibility, "public");
+  assert.match(output.next_step, /PUBLIC/);
+  assert.match(output.next_step, /update_key/);
+  assert.match(output.next_step, /x\.ht-ml\.app/);
+  assert.match(output.next_step, /ht-ml\.app \(https:\/\/ht-ml\.app\), a third-party host not part of Lavish/);
+});
+
+test("password-protected share output tells viewers they also need the password", () => {
+  const output = createShareOutput({
+    source: "/tmp/report.html",
+    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
+    warnings: [],
+    passwordProtected: true,
+  });
+
+  assert.equal(output.share.password_protected, true);
+  assert.equal(output.share.public, false);
+  assert.equal(output.share.visibility, "private");
+  assert.match(output.next_step, /PASSWORD-PROTECTED/);
+  assert.match(output.next_step, /viewers also need the password/);
+  assert.match(output.next_step, /ht-ml\.app \(https:\/\/ht-ml\.app\), a third-party host not part of Lavish/);
+  assert.doesNotMatch(output.next_step, /anyone with the link can view/);
+});
+
+test("share output surfaces local assets that could not be inlined", () => {
+  const output = createShareOutput({
+    source: "/tmp/report.html",
+    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
+    warnings: [{ kind: "load-failed", ref: "./missing.png" }],
+  });
+
+  assert.equal(output.share.unresolved_local_assets, 1);
+  assert.deepEqual(output.unresolved_local_assets, [{ kind: "load-failed", ref: "./missing.png" }]);
+  assert.match(output.next_step, /LOCAL assets could not be inlined/);
+  assert.match(output.next_step, /ht-ml\.app \(https:\/\/ht-ml\.app\), a third-party host not part of Lavish/);
+  assert.doesNotMatch(output.next_step, /share this URL/);
+});
+
+test("share output separates unresolved assets from notices", () => {
+  const output = createShareOutput({
+    source: "/tmp/report.html",
+    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
+    warnings: [
+      { kind: "module-external", ref: "./main.js" },
+      { kind: "file-url-redacted", ref: "file:///Users/kun/secret.png" },
+      { kind: "csp-meta", ref: "script-src 'self'" },
+    ],
+  });
+
+  assert.equal(output.share.unresolved_local_assets, 1);
+  assert.equal(output.share.notices, 2);
+  assert.deepEqual(output.unresolved_local_assets, [{ kind: "module-external", ref: "./main.js" }]);
+  assert.deepEqual(output.notices, [
+    { kind: "file-url-redacted", ref: "file:///Users/kun/secret.png" },
+    { kind: "csp-meta", ref: "script-src 'self'" },
+  ]);
+  assert.equal(output.warnings.length, 3);
+  assert.match(output.next_step, /Export notices are available in notices/);
+});
+
+test("password-protected share output with unresolved assets still mentions the password", () => {
+  const output = createShareOutput({
+    source: "/tmp/report.html",
+    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
+    warnings: [{ kind: "load-failed", ref: "./missing.png" }],
+    passwordProtected: true,
+  });
+
+  assert.equal(output.share.public, false);
+  assert.equal(output.share.visibility, "private");
+  assert.match(output.next_step, /PASSWORD-PROTECTED/);
+  assert.match(output.next_step, /viewers also need the password/);
+  assert.match(output.next_step, /ht-ml\.app \(https:\/\/ht-ml\.app\), a third-party host not part of Lavish/);
+  assert.doesNotMatch(output.next_step, /anyone with the link can view/);
+});
+
+test("share command publishes the artifact to ht-ml.app and returns the public url", async () => {
+  const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-share-test-`);
+  const artifact = `${dir}/report.html`;
+  await writeFile(`${dir}/theme.css`, ".btn{color:teal}", "utf8");
+  await writeFile(
+    artifact,
+    '<!doctype html><html><head><link rel="stylesheet" href="theme.css"></head><body><h1>Hi</h1></body></html>',
+    "utf8",
+  );
+
+  const requests = [];
+  const htmlApp = await startFakeHtmlApp(requests);
+  try {
+    // Use async spawn (not spawnSync): the child publishes to the fake ht-ml.app server hosted
+    // on this process's event loop, which spawnSync would block, deadlocking the request.
+    const child = spawn(
+      process.execPath,
+      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "share", "--password", "pw", artifact],
+      {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: {
+          ...process.env,
+          LAVISH_AXI_STATE_DIR: dir,
+          LAVISH_AXI_TELEMETRY: "0",
+          LAVISH_AXI_HTML_APP_API_URL: `http://127.0.0.1:${htmlApp.port}`,
+        },
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    const code = await new Promise((resolve) => child.on("close", resolve));
+
+    assert.equal(code, 0, stderr);
+    assert.match(stdout, /abc123\.ht-ml\.app/);
+    assert.match(stdout, /PASSWORD-PROTECTED/);
+    assert.match(stdout, /viewers also need the password/);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "/v1/sites");
+    assert.match(requests[0].body.html_content, /<style>\.btn\{color:teal\}<\/style>/);
+    assert.equal(requests[0].body.password, "pw");
+  } finally {
+    await htmlApp.close();
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("share command treats a whitespace-only password as public", async () => {
+  const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-share-test-`);
+  const artifact = `${dir}/report.html`;
+  await writeFile(artifact, "<!doctype html><html><body><h1>Hi</h1></body></html>", "utf8");
+
+  const requests = [];
+  const htmlApp = await startFakeHtmlApp(requests);
+  try {
+    const child = spawn(
+      process.execPath,
+      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "share", "--password", "   ", artifact],
+      {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: {
+          ...process.env,
+          LAVISH_AXI_STATE_DIR: dir,
+          LAVISH_AXI_TELEMETRY: "0",
+          LAVISH_AXI_HTML_APP_API_URL: `http://127.0.0.1:${htmlApp.port}`,
+        },
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    const code = await new Promise((resolve) => child.on("close", resolve));
+
+    assert.equal(code, 0, stderr);
+    assert.match(stdout, /PUBLIC/);
+    assert.match(stdout, /anyone with the link can view/);
+    assert.doesNotMatch(stdout, /PASSWORD-PROTECTED/);
+    assert.equal(requests.length, 1);
+    assert.equal("password" in requests[0].body, false);
+  } finally {
+    await htmlApp.close();
+    await rm(dir, { force: true, recursive: true });
+  }
 });
 
 test("poll help warns agents to leave the long poll running", () => {
@@ -363,11 +963,41 @@ test("poll help warns agents to leave the long poll running", () => {
   assert.match(help, /long-polls indefinitely/);
   assert.match(help, /stays silent/);
   assert.match(help, /never kill it/);
-  assert.match(help, /background task/);
+  assert.match(help, /agent harness/);
+  assert.match(help, /foreground command may run/);
+  assert.match(help, /run the poll as a background task/);
+  assert.doesNotMatch(help, /Codex/);
+  assert.doesNotMatch(help, /do not hide the poll in a background task/);
   assert.match(help, /queued feedback is never lost/);
   assert.match(help, /Do not pass --timeout-ms/);
   assert.match(help, /tests and debugging only/);
   assert.doesNotMatch(help, /above 10 minutes/);
+});
+
+test("poll help is Codex-aware when requested", () => {
+  const help = getCommandHelp("poll", { agent: "codex" });
+
+  assert.match(help, /Codex detected/);
+  assert.match(help, /do not hide the poll in a background task/);
+  assert.match(help, /keep the poll attached to the active turn/);
+  assert.doesNotMatch(help, /agent harness limits/);
+});
+
+test("share help distinguishes public default from password-protected shares", () => {
+  const help = getCommandHelp("share");
+  const home = createHomeOutput({ bin: "lavish-axi", sessions: [] });
+  const homeShareHelp = home.help.find((item) => item.includes("lavish-axi share <html-file>"));
+
+  assert.match(help, /PUBLIC by default/);
+  assert.match(help, /Pass --password to publish a PRIVATE password-protected page/);
+  assert.match(help, /viewers must supply the password to view/);
+  assert.match(help, /not blocked by CSP on ht-ml\.app/);
+  assert.match(help, /load over the viewer's network/);
+  assert.doesNotMatch(help, /EVERYTHING PUBLISHED IS PUBLIC/);
+  assert.doesNotMatch(help, /load fine/);
+  assert.match(homeShareHelp, /PUBLIC by default/);
+  assert.match(homeShareHelp, /Pass --password to publish a PRIVATE password-protected page/);
+  assert.doesNotMatch(homeShareHelp, /Everything published is public/);
 });
 
 test("feedback next step tells agents to keep polling without timeout flag", () => {
@@ -379,11 +1009,28 @@ test("feedback next step tells agents to keep polling without timeout flag", () 
   assert.equal("layout_warnings" in output, false);
   assert.match(output.next_step, /never kill it/);
   assert.match(output.next_step, /without --timeout-ms/);
-  assert.match(output.next_step, /background task/);
+  assert.match(output.next_step, /agent harness/);
+  assert.match(output.next_step, /foreground command may run/);
+  assert.match(output.next_step, /run the poll as a background task/);
+  assert.doesNotMatch(output.next_step, /Codex/);
+  assert.doesNotMatch(output.next_step, /do not hide the poll in a background task/);
   assert.match(output.next_step, /queued feedback is never lost/);
   assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
   assert.match(output.next_step, /fresh layout_warnings/);
   assert.doesNotMatch(output.next_step, /above 10 minutes/);
+});
+
+test("feedback next step is Codex-aware when requested", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: { status: "feedback", dom_snapshot: "", prompts: [] },
+    agent: "codex",
+  });
+
+  assert.match(output.next_step, /Codex detected/);
+  assert.match(output.next_step, /do not hide the poll in a background task/);
+  assert.match(output.next_step, /keep the poll attached to the active turn/);
+  assert.doesNotMatch(output.next_step, /agent harness limits/);
 });
 
 test("layout warning feedback tells agents to fix layout before involving the human", () => {
@@ -410,6 +1057,238 @@ test("layout warning feedback tells agents to fix layout before involving the hu
   assert.match(output.next_step, /1 layout warning detected/);
   assert.match(output.next_step, /fix horizontal overflow/);
   assert.match(output.next_step, /before involving the human/);
+  assert.doesNotMatch(output.next_step, /reload or re-open/);
+});
+
+test("whiteboard feedback tells agents to read the summary, inspect files when needed, and update the Mermaid source", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [
+        {
+          uid: "",
+          prompt: "Whiteboard edits to diagram 1:\nMoved rectangle (Auth)",
+          selector: "",
+          tag: "whiteboard",
+          text: "Whiteboard: diagram 1",
+          target: {
+            type: "excalidraw-scene",
+            diagramIndex: 0,
+            diagramId: "mermaid-1",
+            sourceHash: "abc",
+            scenePath: "/state/whiteboards/k/0.excalidraw",
+            previewPath: "/state/whiteboards/k/0.png",
+            imageFallback: false,
+            stats: { added: 0, removed: 0, moved: 1, relabeled: 0, drawn: 0 },
+          },
+        },
+      ],
+    },
+  });
+
+  assert.match(output.next_step, /whiteboard edits \(tag "whiteboard"\)/);
+  assert.match(output.next_step, /read the edit summary in the prompt text first/);
+  assert.match(output.next_step, /scenePath/);
+  assert.match(output.next_step, /previewPath/);
+  assert.match(output.next_step, /Mermaid source stays authoritative/);
+  assert.match(output.next_step, /never try to write the \.excalidraw scene back/);
+});
+
+test("non-whiteboard feedback does not mention whiteboard guidance", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [{ uid: "", prompt: "Tighten this", selector: "h1", tag: "h1", text: "Title" }],
+    },
+  });
+
+  assert.doesNotMatch(output.next_step, /whiteboard/i);
+});
+
+test("a poll reporting the session ended by the user tells the agent to stop and not reopen", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: { status: "ended", ended_by: "user" },
+  });
+
+  assert.equal(output.session.status, "ended");
+  assert.equal(output.session.ended_by, "user");
+  assert.match(output.next_step, /user ended this Lavish Editor session/);
+  assert.match(output.next_step, /Stop polling/);
+  assert.match(output.next_step, /do not run `lavish-axi \/tmp\/report\.html` to reopen it/);
+  assert.match(output.next_step, /deliver any remaining updates directly in this conversation/i);
+  assert.match(output.next_step, /lavish-axi \/tmp\/report\.html --reopen/);
+});
+
+test("a poll reporting an agent-ended session allows a plain reopen if still needed", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: { status: "ended", ended_by: "agent" },
+  });
+
+  assert.equal(output.session.ended_by, "agent");
+  assert.match(output.next_step, /Stop polling/);
+  assert.match(output.next_step, /lavish-axi \/tmp\/report\.html`\s+to open a fresh session/);
+  assert.doesNotMatch(output.next_step, /--reopen/);
+});
+
+test("the final feedback batch before a user end flags session_ended and skips the reopen instruction", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [{ uid: "", prompt: "Parting feedback", selector: "", tag: "message", text: "bye" }],
+      session_ended: true,
+      ended_by: "user",
+    },
+  });
+
+  assert.equal(output.session.session_ended, true);
+  assert.equal(output.session.ended_by, "user");
+  assert.match(output.next_step, /last feedback before the user ended the session/);
+  assert.match(output.next_step, /Stop polling \/tmp\/report\.html and do not reopen it/);
+  assert.match(output.next_step, /lavish-axi \/tmp\/report\.html --reopen/);
+  assert.doesNotMatch(output.next_step, /reload or re-open/);
+});
+
+test("the final feedback batch before an agent end preserves ended_by and allows plain reopen", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [{ uid: "", prompt: "Parting feedback", selector: "", tag: "message", text: "bye" }],
+      session_ended: true,
+      ended_by: "agent",
+    },
+  });
+
+  assert.equal(output.session.session_ended, true);
+  assert.equal(output.session.ended_by, "agent");
+  assert.match(output.next_step, /last feedback before the Lavish Editor session ended/);
+  assert.match(output.next_step, /lavish-axi \/tmp\/report\.html`\s+to open a fresh session/);
+  assert.doesNotMatch(output.next_step, /--reopen/);
+  assert.doesNotMatch(output.next_step, /user ended this Lavish Editor session/);
+});
+
+test("persistent layout warnings after a failed fix attempt permit proceeding to the human", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [],
+      layout_warnings: [
+        {
+          selector: "main > header > strong",
+          kind: "overlapping-text",
+          overflowPx: 0,
+          viewportWidth: 720,
+          severity: "warning",
+          persistent: true,
+        },
+      ],
+    },
+  });
+
+  assert.match(output.next_step, /already reported in a prior poll/);
+  assert.match(output.next_step, /fine to proceed to the human with a short note/);
+  assert.doesNotMatch(output.next_step, /fix horizontal overflow/);
+});
+
+test("low-severity text-flow warnings permit proceeding to the human without looping", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [],
+      layout_warnings: [
+        {
+          selector: "main > header > code",
+          kind: "overlapping-text",
+          overflowPx: 0,
+          viewportWidth: 720,
+          severity: "warning",
+          persistent: false,
+        },
+      ],
+    },
+  });
+
+  assert.match(output.next_step, /low-severity layout warning/);
+  assert.match(output.next_step, /fine to proceed to the human with a note/);
+  assert.doesNotMatch(output.next_step, /fix horizontal overflow/);
+});
+
+test("a mix of fresh error-severity and persistent warnings still mandates a fix pass", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [],
+      layout_warnings: [
+        {
+          selector: "html",
+          kind: "page-horizontal-overflow",
+          overflowPx: 16,
+          viewportWidth: 720,
+          severity: "error",
+          persistent: false,
+        },
+        {
+          selector: ".badge",
+          kind: "clipped-text",
+          overflowPx: 12,
+          viewportWidth: 720,
+          severity: "error",
+          persistent: true,
+        },
+      ],
+    },
+  });
+
+  assert.match(output.next_step, /2 layout warnings detected - fix horizontal overflow/);
+  assert.match(output.next_step, /before involving the human/);
+});
+
+test("a mix of persistent errors and fresh low-severity warnings permits proceeding", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [],
+      layout_warnings: [
+        {
+          selector: ".badge",
+          kind: "clipped-text",
+          overflowPx: 12,
+          viewportWidth: 720,
+          severity: "error",
+          persistent: true,
+        },
+        {
+          selector: "main > header > code",
+          kind: "overlapping-text",
+          overflowPx: 0,
+          viewportWidth: 720,
+          severity: "warning",
+          persistent: false,
+        },
+      ],
+    },
+  });
+
+  assert.match(output.next_step, /no fresh error-severity findings/);
+  assert.match(output.next_step, /fine to proceed to the human with a note/);
+  assert.doesNotMatch(output.next_step, /fix horizontal overflow/);
 });
 
 test("poll wait messages tell watching agents the silence is normal", () => {
@@ -545,6 +1424,59 @@ test("setup hooks resolves HOME before platform-specific user profile variables"
   );
 });
 
+test("setup hooks resolves Copilot hook directory from COPILOT_HOME first", () => {
+  assert.equal(
+    resolveCopilotHookDir({ COPILOT_HOME: "/tmp/copilot-home", HOME: "/tmp/home" }),
+    path.join("/tmp/copilot-home", "hooks"),
+  );
+  assert.equal(resolveCopilotHookDir({ HOME: "/tmp/home" }), path.join("/tmp/home", ".copilot", "hooks"));
+});
+
+test("setup hooks creates a Copilot CLI hook that injects additional context", () => {
+  const hook = createCopilotCliSessionStartHook();
+  const [updated, changed] = computeCopilotCliHookUpdate(
+    {
+      version: 1,
+      hooks: {
+        sessionStart: [{ type: "command", bash: "echo keep-me" }],
+      },
+    },
+    hook,
+  );
+
+  assert.equal(changed, true);
+  assert.equal(updated.version, 1);
+  assert.equal(updated.hooks.sessionStart.length, 2);
+  assert.equal(updated.hooks.sessionStart[0].bash, "echo keep-me");
+  assert.match(updated.hooks.sessionStart[1].bash, /additionalContext/);
+  assert.match(updated.hooks.sessionStart[1].powershell, /additionalContext/);
+  assert.match(updated.hooks.sessionStart[1].bash, /lavish-axi/);
+  assert.equal(updated.hooks.sessionStart[1].timeoutSec, 10);
+
+  const [unchanged, unchangedFlag] = computeCopilotCliHookUpdate(updated, hook);
+  assert.equal(unchangedFlag, false);
+  assert.equal(unchanged, updated);
+});
+
+test("Copilot CLI ambient context script wraps lavish output as hook JSON", async () => {
+  const tempDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-copilot-hook-`);
+  try {
+    const fakeCli = path.join(tempDir, "fake-lavish.js");
+    await writeFile(fakeCli, 'console.log("sessions: []");\n', "utf8");
+    const command = `"${process.execPath}" "${fakeCli}"`;
+    const result = spawnSync(process.execPath, ["-e", createCopilotCliAmbientContextScript(command)], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const output = JSON.parse(result.stdout);
+    assert.match(output.additionalContext, /## AXI ambient context: lavish-axi/);
+    assert.match(output.additionalContext, /sessions: \[\]/);
+  } finally {
+    await rm(tempDir, { force: true, recursive: true });
+  }
+});
+
 test("setup hooks installs agent session hooks explicitly", async () => {
   const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-setup-state-`);
   const homeDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-setup-home-`);
@@ -555,15 +1487,23 @@ test("setup hooks installs agent session hooks explicitly", async () => {
       {
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         encoding: "utf8",
-        env: { ...process.env, HOME: homeDir, LAVISH_AXI_STATE_DIR: stateDir },
+        env: setupHooksEnv(homeDir, stateDir),
       },
     );
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.match(result.stdout, /hooks:/);
     assert.match(result.stdout, /status: installed/);
+    assert.match(result.stdout, /GitHub Copilot CLI/);
     assert.match(result.stdout, /Restart your agent session/);
     assert.ok(existsSync(`${homeDir}/.claude/settings.json`));
+    assert.ok(existsSync(`${homeDir}/.copilot/hooks/lavish-axi.json`));
+
+    const copilotHook = JSON.parse(await readFile(`${homeDir}/.copilot/hooks/lavish-axi.json`, "utf8"));
+    assert.equal(copilotHook.version, 1);
+    assert.equal(copilotHook.hooks.sessionStart.length, 1);
+    assert.match(copilotHook.hooks.sessionStart[0].bash, /additionalContext/);
+    assert.match(copilotHook.hooks.sessionStart[0].powershell, /additionalContext/);
   } finally {
     await rm(stateDir, { force: true, recursive: true });
     await rm(homeDir, { force: true, recursive: true });
@@ -583,7 +1523,7 @@ test("setup hooks exits with an error when hook installation fails", async () =>
       {
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         encoding: "utf8",
-        env: { ...process.env, HOME: homeDir, LAVISH_AXI_STATE_DIR: stateDir },
+        env: setupHooksEnv(homeDir, stateDir),
       },
     );
 
@@ -735,6 +1675,7 @@ test("open can resume a session without opening another browser window", () => {
   assert.equal(shouldOpenBrowser(["artifact.html"], {}), true);
   assert.match(getCommandHelp("open"), /--no-open/);
   assert.match(getCommandHelp("open"), /--no-gate/);
+  assert.match(getCommandHelp("open"), /--reopen/);
   assert.match(getCommandHelp("playbook"), /diagram/);
   assert.match(getCommandHelp("playbook"), /code/);
   assert.match(getCommandHelp("playbook"), /input/);
@@ -743,16 +1684,9 @@ test("open can resume a session without opening another browser window", () => {
   assert.match(getCommandHelp("design"), /DaisyUI/);
   assert.match(getCommandHelp("design"), /lavish-axi design/);
   assert.match(getCommandHelp("design"), /portable/);
-  assert.match(getCommandHelp("design"), /prefer.*CDN snippet.*hand-writing styles/i);
-  assert.match(getCommandHelp("design"), /unless.*explicitly instructed/i);
-  assert.match(getCommandHelp("design"), /priority order/i);
-  assert.match(getCommandHelp("design"), /project the artifact is about/i);
-  assert.match(getCommandHelp("design"), /current working directory/i);
-  assert.match(getCommandHelp("design"), /previews, proposes, or mocks/i);
-  assert.match(getCommandHelp("design"), /app's own design system/i);
+  assert.ok(getCommandHelp("design").includes(DESIGN_PRIORITY_RULE), "design help embeds the single-sourced rule");
   assert.match(getCommandHelp("design"), /fallback, not the default/i);
   assert.match(getCommandHelp("design"), /inspect the subject project/i);
-  assert.doesNotMatch(getCommandHelp("design"), /inspect the current project/i);
   assert.doesNotMatch(getCommandHelp("design"), /auto-injects/);
 });
 
@@ -920,3 +1854,30 @@ test("drainSseBuffer returns a trailing partial frame for the next read (I1 regr
   assert.equal(handled.length, 1);
   assert.equal(rest, "event: mess", "the incomplete frame is preserved");
 });
+async function startFakeHtmlApp(requests) {
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      raw += chunk;
+    });
+    req.on("end", () => {
+      requests.push({ method: req.method, url: req.url, body: raw ? JSON.parse(raw) : null });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          site_id: "abc123",
+          url: "https://abc123.ht-ml.app/",
+          update_key: "uk_secret",
+          status: "active",
+        }),
+      );
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  return {
+    port: typeof address === "object" && address ? address.port : 0,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}

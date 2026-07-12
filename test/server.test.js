@@ -1,15 +1,22 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+
+process.env.LAVISH_AXI_HOST = "127.0.0.1";
+process.env.LAVISH_AXI_LINK_HOST = "127.0.0.1";
 
 import {
   createChromeHtml,
   createSdkJs,
   displayPathParts,
+  exportContentDisposition,
+  extractArtifactHead,
   hasLiveReloadRootOptIn,
   resolveArtifactAsset,
+  resolveDesignAssetPath,
   resolveIdleTimeoutMs,
   resolveWatchTarget,
   serve,
@@ -88,6 +95,13 @@ test("server serves chrome styles from a dedicated source file", async () => {
   assert.match(source, /chrome\.css/);
   assert.match(html, /<link rel="stylesheet" href="\/chrome\.css">/);
   assert.doesNotMatch(html, /<style>/);
+});
+
+test("export content disposition uses a safe fallback and encoded UTF-8 filename", () => {
+  assert.equal(
+    exportContentDisposition('/tmp/résumé "draft"\n.html'),
+    "attachment; filename=\"r_sum_ _draft__.export.html\"; filename*=UTF-8''r%C3%A9sum%C3%A9%20%22draft%22%0A.export.html",
+  );
 });
 
 test("artifact assets resolve within the artifact directory", () => {
@@ -181,8 +195,28 @@ test("annotation hover remains active while another element is selected", () => 
   const js = createSdkJs("abc");
 
   assert.doesNotMatch(js, /\|\|selected\)return/);
-  assert.match(js, /if \(event\.target === selected\) return/);
+  assert.match(js, /if \(target === selected\) return/);
   assert.match(js, /if \(hovered && hovered !== selected\) clearHighlight\(hovered\)/);
+});
+
+test("artifact SDK injects every shared mermaid node helper as a same-scope const", () => {
+  const js = createSdkJs("abc");
+
+  for (const name of ["isMermaidSvg", "readNodeLabel", "mermaidNodeElement", "mermaidNodeFrom"]) {
+    assert.match(js, new RegExp(`const ${name}=`));
+  }
+  // mermaidNodeFrom calls mermaidNodeElement, so the resolver must reach the
+  // SDK's mermaidHelpers bundle or the browser would ReferenceError on click.
+  assert.match(js, /const mermaidHelpers=\{[^}]*mermaidNodeElement[^}]*\}/);
+});
+
+test("annotation hover and click resolve to the same Mermaid node element", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /function annotationTargetEl/);
+  assert.match(js, /mermaidNodeElement\(el\) \|\| el/);
+  assert.match(js, /hovered = target/);
+  assert.match(js, /anchor = annotationTargetEl\(target\)/);
 });
 
 test("annotation mode forces the artifact cursor to default", () => {
@@ -191,6 +225,46 @@ test("annotation mode forces the artifact cursor to default", () => {
   assert.match(js, /lavish-cursor-style/);
   assert.match(js, /cursor:default!important/);
   assert.match(js, /setAnnotationMode\(enabled\)/);
+});
+
+test("artifact SDK registers a capture-phase document keydown listener for the mode toggle hotkey", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /const MODE_TOGGLE_HOTKEY_KEY="i"/);
+  assert.match(js, /function isModeToggleHotkeyEvent\(event\)/);
+  assert.match(js, /if \(!isModeToggleHotkeyEvent\(event\)\) return;/);
+  assert.match(js, /parent\.postMessage\(\{ type: "lavish:toggleAnnotationMode" \}, "\*"\);/);
+  // Registered with the capture flag so it fires regardless of where focus is inside the
+  // sandboxed artifact document, without a duplicate call sneaking in un-captured.
+  assert.match(
+    js,
+    /document\.addEventListener\(\s*"keydown",\s*\(event\) => \{\s*if \(!isModeToggleHotkeyEvent\(event\)\) return;\s*event\.preventDefault\(\);\s*parent\.postMessage\(\{ type: "lavish:toggleAnnotationMode" \}, "\*"\);\s*\},\s*true,?\s*\);/,
+  );
+});
+
+test("chrome client toggles annotation mode via Cmd/Ctrl+I and on request from the artifact SDK", async () => {
+  const js = await chromeClientSource();
+
+  assert.match(
+    js,
+    /const MODE_TOGGLE_HOTKEY_KEY = String\(sessionData\.modeToggleHotkeyKey \|\| ""\)\.toLowerCase\(\);/,
+  );
+  assert.doesNotMatch(js, /const MODE_TOGGLE_HOTKEY_KEY = "i";/);
+  assert.match(js, /function isModeToggleHotkeyEvent\(event\)/);
+  assert.match(js, /function toggleAnnotationMode\(\)/);
+  assert.match(js, /annotationSwitch\.onclick = toggleAnnotationMode;/);
+  assert.match(js, /if \(msg\.type === "lavish:toggleAnnotationMode"\) toggleAnnotationMode\(\);/);
+  assert.match(
+    js,
+    /document\.addEventListener\(\s*"keydown",\s*\(event\) => \{\s*if \(!isModeToggleHotkeyEvent\(event\)\) return;\s*event\.preventDefault\(\);\s*toggleAnnotationMode\(\);\s*\},\s*true,?\s*\);/,
+  );
+});
+
+test("the annotate switch exposes the mode toggle hotkey as a discoverable tooltip", () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+
+  assert.match(html, /"modeToggleHotkeyKey":"i"/);
+  assert.match(html, /id="annotation"[^>]*title="Toggle annotate\/explore mode \(⌘I \/ Ctrl\+I\)"/);
 });
 
 test("artifact SDK lets marked feedback controls handle their own clicks", () => {
@@ -404,6 +478,52 @@ test("overflow menu offers reload, snapshot copy, and end session actions", asyn
   assert.match(js, /event\.key === "Escape"/);
 });
 
+test("overflow menu offers a standalone HTML export that downloads a portable file", async () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const js = await chromeClientSource();
+
+  assert.match(html, /id="exportArtifact"[^<]*>.*Export standalone HTML/);
+  assert.match(js, /const exportArtifactButton/);
+  assert.match(js, /async function exportArtifact/);
+  assert.match(js, /fetch\("\/api\/" \+ key \+ "\/export"\)/);
+  assert.match(js, /link\.download = exportFileName\(\)/);
+  assert.match(js, /exportArtifactButton\.onclick = exportArtifact/);
+});
+
+test("overflow menu offers publishing an ht-ml.app link via a share dialog", async () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const js = await chromeClientSource();
+  const css = await chromeCssSource();
+
+  assert.match(html, /id="shareArtifact"[^<]*>.*Publish link/);
+  assert.match(html, /id="shareDialog"/);
+  assert.match(
+    html,
+    /Publish to <a class="share-link" href="https:\/\/ht-ml\.app" target="_blank" rel="noopener noreferrer">ht-ml\.app<\/a>/,
+  );
+  assert.match(html, /third-party hosting service, not part of Lavish/);
+  assert.match(html, /id="sharePassword"/);
+  assert.match(html, /id="shareUpdateKey"/);
+  assert.match(html, /Without a password, the page is PUBLIC/);
+  assert.match(html, /With a password, the page is PRIVATE/);
+  assert.doesNotMatch(html, /Everything published is public/);
+  assert.doesNotMatch(html, /Get a public link/);
+  assert.match(css, /\.share-overlay/);
+  assert.match(css, /\.share-overlay\{[^}]*z-index:80;/);
+  assert.match(css, /\.share-card/);
+  assert.match(css, /\.share-link/);
+  assert.match(css, /box-shadow:var\(--shadow-floating\)/);
+  // The codebase has no global [hidden] rule, so display-setting overlays need explicit
+  // [hidden] rules or they show through before they should (e.g. the result block).
+  assert.match(css, /\.share-overlay\[hidden\]\{display:none;?\}/);
+  assert.match(css, /\.share-result\[hidden\]\{display:none;?\}/);
+  assert.match(js, /const shareArtifactButton/);
+  assert.match(js, /async function publishShare/);
+  assert.match(js, /fetch\("\/api\/" \+ key \+ "\/share"/);
+  assert.match(js, /shareUrlInput\.value = data\.url/);
+  assert.match(js, /shareUpdateKeyInput\.value = data\.update_key/);
+});
+
 test("copy DOM snapshot requests a fresh snapshot and copies it to the clipboard", async () => {
   const js = await chromeClientSource();
 
@@ -454,6 +574,9 @@ test("chrome includes a chat-like prompt composer and agent reply listener", asy
   const js = await chromeClientSource();
 
   assert.match(html, /id="chatLog"/);
+  const css = await chromeCssSource();
+  assert.match(css, /\.chat:empty::before\{/);
+  assert.match(css, /Agent hasn't sent a message yet/);
   assert.match(html, /id="chatInput"/);
   assert.match(js, /agent-reply/);
 });
@@ -498,7 +621,7 @@ test("chrome disables sending only while ended, never while working (change #2)"
   assert.match(js, /function updateSendState\(\)/);
   // Change #2: the Send button / chat input are gated only by `ended`, not by "working".
   assert.match(js, /sendButton\.disabled = ended;/);
-  assert.match(js, /sendCaret\.disabled = ended;/);
+  assert.match(js, /sendAndEndButton\.disabled = sendButton\.disabled/);
   assert.doesNotMatch(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
   // The sendQueued early-return guard must no longer block on "working" either.
   assert.doesNotMatch(js, /if \(ended \|\| agentPresence === "working"\) return;/);
@@ -510,23 +633,28 @@ test("sending with an empty composer nudges instead of blocking", async () => {
   const js = await chromeClientSource();
   const css = await chromeCssSource();
 
-  assert.match(html, /class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.</);
+  assert.match(html, /class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div>/);
   assert.match(js, /function showSendHint\(\)/);
   assert.match(js, /sendHint\.hidden = false/);
   assert.match(js, /chatInput\.focus\(\)/);
   assert.match(css, /\.send-hint\{/);
 });
 
-test("composer send is a split button with a send-and-end option", async () => {
+test("composer offers two always-visible top-level send actions", async () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
   const css = await chromeCssSource();
 
-  assert.match(html, /class="button send-main" id="send">Send to Agent</);
-  assert.match(html, /class="button send-caret" id="sendCaret"/);
-  assert.match(html, /class="menu send-menu" id="sendMenu" hidden/);
-  assert.match(html, /id="sendAndEnd"[^<]*>.*Send &amp; end session/);
-  assert.match(css, /\.send-main\{[^}]*border-radius:var\(--radius-md\) 0 0 var\(--radius-md\)/);
-  assert.match(css, /\.send-caret\{[^}]*border-left:1px solid rgba\(23,19,10,.22\)/);
+  assert.match(html, /class="button" id="send">Send to Agent</);
+  assert.match(html, /class="button button-danger" id="sendAndEnd"[^<]*>.*Send &amp; End</);
+  assert.match(
+    html,
+    /<div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">.*<button class="button" id="send">Send to Agent<\/button><\/div>/,
+  );
+  assert.doesNotMatch(html, /id="sendCaret"/);
+  assert.doesNotMatch(html, /id="sendMenu"/);
+  assert.doesNotMatch(html, /id="sendFromMenu"/);
+  assert.match(css, /\.button-danger\{[^}]*color:var\(--danger\)/);
+  assert.match(css, /\.actions\{[^}]*min-width:0/);
 });
 
 test("send and end submits queued prompts before ending the session", async () => {
@@ -534,10 +662,10 @@ test("send and end submits queued prompts before ending the session", async () =
 
   assert.match(js, /let endAfterSubmit = false/);
   assert.match(js, /sendQueued\(true\)/);
-  assert.doesNotMatch(js, /const shouldEndAfterSubmit = endAfterSubmit/);
-  assert.doesNotMatch(js, /if \(shouldEndAfterSubmit\) await endSession\(\)/);
+  assert.match(js, /if \(shouldEndSession\) body\.endSession = true/);
+  assert.match(js, /if \(shouldEndSession\) \{\n {4}endAfterSubmit = false;\n {4}markSessionEnded\(\)/);
   assert.match(js, /if \(!succeeded\) \{\n {6}endAfterSubmit = false/);
-  assert.match(js, /\} else if \(endAfterSubmit\) \{\n {6}endAfterSubmit = false;\n {6}await endSession\(\)/);
+  assert.doesNotMatch(js, /await endSession\(\)/);
 });
 
 test("chrome only marks session ended after the end request succeeds", async () => {
@@ -545,7 +673,7 @@ test("chrome only marks session ended after the end request succeeds", async () 
 
   assert.match(js, /const response = await fetch\("\/api\/" \+ key \+ "\/end", \{ method: "POST" \}\)/);
   assert.match(js, /if \(!response\.ok\) throw new Error\("failed to end session"\)/);
-  assert.match(js, /if \(!response\.ok\) throw new Error\("failed to end session"\);\n {2}ended = true/);
+  assert.match(js, /if \(!response\.ok\) throw new Error\("failed to end session"\);\n {2}markSessionEnded\(\)/);
 });
 
 test("chrome shows a waiting banner when no agent has attached", async () => {
@@ -559,12 +687,16 @@ test("chrome shows a waiting banner when no agent has attached", async () => {
   assert.match(css, /\.presence-banner\{/);
 });
 
-test("chrome puts queued annotations inside the chat composer as preview pills", async () => {
+test("chrome puts queued annotations above the chat composer as preview pills", async () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
   const js = await chromeClientSource();
   const css = await chromeCssSource();
 
   assert.match(html, /id="annotationPills"/);
+  assert.match(
+    html,
+    /<div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"><\/div><div class="annotation-pills" id="annotationPills"><\/div><\/div><div class="composer">/,
+  );
   assert.match(js, /class="pill/);
   assert.match(js, /pill-preview/);
   assert.match(js, /removeQueuedPrompt/);
@@ -573,6 +705,19 @@ test("chrome puts queued annotations inside the chat composer as preview pills",
   assert.doesNotMatch(js, /togglePill/);
   assert.doesNotMatch(js, /pill-detail/);
   assert.doesNotMatch(html, /<h2>Queued Annotations<\/h2>/);
+});
+
+test("chrome scrolls queued prompts above a sticky composer footer", async () => {
+  const css = await chromeCssSource();
+
+  assert.match(css, /\.panel-scroll\{[^}]*flex:1 1 auto/);
+  assert.match(css, /\.panel-scroll\{[^}]*min-height:0/);
+  assert.match(css, /\.panel-scroll\{[^}]*overflow-y:auto/);
+  assert.match(css, /\.chat\{[^}]*overflow:visible/);
+  assert.match(css, /\.annotation-pills\{[^}]*flex:0 0 auto/);
+  assert.match(css, /\.composer\{[^}]*position:sticky/);
+  assert.match(css, /\.composer\{[^}]*bottom:0/);
+  assert.match(css, /\.composer\{[^}]*flex-shrink:0/);
 });
 
 test("chrome omits clear queue button because pills can be removed individually", async () => {
@@ -585,12 +730,17 @@ test("chrome omits clear queue button because pills can be removed individually"
 
 test("annotation pill tooltip separates target and prompt details", async () => {
   const js = await chromeClientSource();
+  const css = await chromeCssSource();
 
   assert.match(js, /tooltip-label/);
   assert.match(js, /Target/);
   assert.match(js, /Prompt/);
   assert.match(js, /pill-tooltip-target/);
   assert.match(js, /pill-tooltip-prompt/);
+  assert.match(css, /\.pill-wrap\{[^}]*width:min\(320px,100%\)/);
+  assert.match(css, /\.pill-tooltip\{[^}]*position:static/);
+  assert.match(css, /\.pill-tooltip\{[^}]*width:100%/);
+  assert.doesNotMatch(css, /\.pill-tooltip\{[^}]*position:absolute/);
 });
 
 test("chrome client script is valid JavaScript", async () => {
@@ -610,6 +760,7 @@ test("composer textarea is sized within the right panel", async () => {
 
   assert.match(css, /\.layout\{[^}]*min-height:0/);
   assert.match(css, /\.panel\{[^}]*min-height:0/);
+  assert.match(css, /\.panel-scroll\{[^}]*min-height:0/);
   assert.match(css, /\.chat\{[^}]*min-height:0/);
   assert.match(css, /\.composer\{[^}]*min-width:0/);
   assert.match(css, /\.composer\{[^}]*flex-shrink:0/);
@@ -634,6 +785,26 @@ test("artifact SDK audits layout after fonts and ResizeObserver settle", () => {
   assert.match(js, /element-scroll-overflow/);
   assert.match(js, /element-parent-overflow/);
   assert.match(js, /clipped-text/);
+  assert.match(js, /overlapping-text/);
+});
+
+test("artifact SDK dedups cascading visible-overflow spills to the innermost element", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /function resolveSpillCandidates/);
+  assert.match(js, /function resolveVisibleSpillCandidates/);
+  assert.match(js, /spillBottom/);
+  assert.match(js, /candidate\.el\.contains\(other\.el\)/);
+});
+
+test("artifact SDK uses per-fragment rects, not the bounding box, for overlap detection", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /function elementLineFragments/);
+  assert.match(js, /el\.getClientRects\(\)/);
+  assert.match(js, /fragmentsSignificantlyOverlap/);
+  assert.match(js, /function rectAreaOf\(rect\)/);
+  assert.match(js, /function intersectionAreaOf\(a, b\)/);
 });
 
 test("artifact SDK reports its scroll position and restores it on request", () => {
@@ -706,7 +877,8 @@ test("chrome submits prompts queued during an in-flight submit", async () => {
   assert.match(js, /let submitQueuedAgain = false/);
   assert.match(js, /submitQueuedAgain = true/);
   assert.match(js, /const shouldSubmitAgain = submitQueuedAgain/);
-  assert.match(js, /else if \(shouldSubmitAgain && queued\.length\) \{\n {6}submitQueued\(\)/);
+  assert.match(js, /else if \(!ended && shouldSubmitAgain\) \{\n {6}if \(queued\.length\) \{\n {8}submitQueued\(\)/);
+  assert.match(js, /else if \(endAfterSubmit\) \{\n {8}endAfterSubmit = false;\n {8}endSession\(\)/);
 });
 
 test("/health reports the server version so clients can detect upgrades", async () => {
@@ -897,6 +1069,7 @@ test("layout warnings wake the same long-poll feedback channel as human prompts"
           overflowPx: 12,
           viewportWidth: 720,
           severity: "error",
+          persistent: false,
         },
       ],
     });
@@ -1010,6 +1183,327 @@ test("/design serves local Tailwind and DaisyUI artifact assets", async () => {
     assert.match(await themes.text(), /luxury/);
   } finally {
     await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("design asset resolver only trusts exact packaged design asset paths", () => {
+  assert.equal(resolveDesignAssetPath("/design/daisyui.css/extra"), null);
+  assert.equal(resolveDesignAssetPath("/design/tailwindcss-browser.js/extra"), null);
+});
+
+test("GET /api/:key/export inlines local assets and leaves remote references intact", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(
+    artifact,
+    `<!doctype html><html><head><link rel="stylesheet" href="local.css">` +
+      `<link rel="stylesheet" href="https://cdn.example/app.css"></head>` +
+      `<body><img src="pic.png"><h1>Hi</h1><script src="/sdk.js?key=stale"></script></body></html>`,
+  );
+  await writeFile(path.join(dir, "local.css"), ".btn{color:green}");
+  await writeFile(path.join(dir, "pic.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const exportRes = await fetch(`${base}/api/${session.key}/export`);
+    assert.equal(exportRes.status, 200);
+    assert.match(exportRes.headers.get("content-disposition") || "", /attachment; filename="artifact\.export\.html"/);
+    const body = await exportRes.text();
+    // local stylesheet + image inlined
+    assert.match(body, /<style>\.btn\{color:green\}<\/style>/);
+    assert.match(body, /<img src="data:image\/png;base64,iVBORw==">/);
+    // injected SDK stripped
+    assert.doesNotMatch(body, /sdk\.js/);
+    // remote stylesheet left intact (not fetched/inlined)
+    assert.match(body, /<link rel="stylesheet" href="https:\/\/cdn\.example\/app\.css">/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/:key/export sends a safe download filename header", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "résumé draft.html");
+  await writeFile(artifact, "<!doctype html><html><body><h1>Hi</h1></body></html>");
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const exportRes = await fetch(`${base}/api/${session.key}/export`);
+
+    assert.equal(exportRes.status, 200);
+    assert.equal(
+      exportRes.headers.get("content-disposition"),
+      "attachment; filename=\"r_sum_ draft.export.html\"; filename*=UTF-8''r%C3%A9sum%C3%A9%20draft.export.html",
+    );
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/:key/export reports unresolved local asset warning count", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, '<!doctype html><html><body><img src="missing.png"></body></html>');
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const exportRes = await fetch(`${base}/api/${session.key}/export`);
+    const body = await exportRes.text();
+
+    assert.equal(exportRes.status, 200);
+    assert.equal(exportRes.headers.get("x-lavish-export-warning-count"), "1");
+    assert.equal(exportRes.headers.get("x-lavish-export-notice-count"), "0");
+    assert.equal(exportRes.headers.get("x-lavish-export-warnings"), null);
+    assert.match(body, /<img src="missing\.png">/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/:key/export counts notices separately from unresolved assets", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(
+    artifact,
+    '<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="script-src \'self\'"></head><body><h1>Ship</h1></body></html>',
+  );
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const exportRes = await fetch(`${base}/api/${session.key}/export`);
+    const body = await exportRes.text();
+
+    assert.equal(exportRes.status, 200);
+    assert.equal(exportRes.headers.get("x-lavish-export-warning-count"), "0");
+    assert.equal(exportRes.headers.get("x-lavish-export-notice-count"), "1");
+    assert.match(body, /Content-Security-Policy/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/:key/export returns 404 for an unknown session", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.port}/api/does-not-exist/export`);
+    assert.equal(res.status, 404);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/:key/share publishes the local-inlined artifact to ht-ml.app", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(
+    artifact,
+    '<!doctype html><html><head><link rel="stylesheet" href="local.css">' +
+      '<link rel="stylesheet" href="https://cdn.example/app.css"></head>' +
+      '<body><h1>Ship</h1><script src="/sdk.js?key=x"></script></body></html>',
+  );
+  await writeFile(path.join(dir, "local.css"), ".btn{color:red}");
+
+  const requests = [];
+  const htmlApp = await startFakeHtmlApp(requests);
+  const previousApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
+  process.env.LAVISH_AXI_HTML_APP_API_URL = `http://127.0.0.1:${htmlApp.port}`;
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const shareRes = await fetch(`${base}/api/${session.key}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ password: "pw" }),
+    });
+    const body = await shareRes.json();
+
+    assert.equal(shareRes.status, 200);
+    assert.deepEqual(body, {
+      url: "https://abc123.ht-ml.app/",
+      site_id: "abc123",
+      update_key: "uk_secret",
+      status: "active",
+    });
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].method, "POST");
+    assert.equal(requests[0].url, "/v1/sites");
+    // local stylesheet inlined, SDK stripped, remote stylesheet left intact (never fetched)
+    assert.match(requests[0].body.html_content, /<style>\.btn\{color:red\}<\/style>/);
+    assert.doesNotMatch(requests[0].body.html_content, /sdk\.js/);
+    assert.match(requests[0].body.html_content, /<link rel="stylesheet" href="https:\/\/cdn\.example\/app\.css">/);
+    assert.equal(requests[0].body.password, "pw");
+  } finally {
+    await server.close();
+    await htmlApp.close();
+    restoreEnv("LAVISH_AXI_HTML_APP_API_URL", previousApiUrl);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/:key/share returns unresolved local asset warnings", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, '<!doctype html><html><body><img src="missing.png"><h1>Ship</h1></body></html>');
+
+  const requests = [];
+  const htmlApp = await startFakeHtmlApp(requests);
+  const previousApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
+  process.env.LAVISH_AXI_HTML_APP_API_URL = `http://127.0.0.1:${htmlApp.port}`;
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const shareRes = await fetch(`${base}/api/${session.key}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({}),
+    });
+    const body = await shareRes.json();
+
+    assert.equal(shareRes.status, 200);
+    assert.equal(body.url, "https://abc123.ht-ml.app/");
+    assert.equal(body.warnings.length, 1);
+    assert.equal(body.unresolved_local_assets.length, 1);
+    assert.equal("notices" in body, false);
+    assert.equal(body.warnings[0].kind, "load-failed");
+    assert.equal(body.warnings[0].ref, "missing.png");
+    assert.match(body.warnings[0].reason || "", /ENOENT/);
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].body.html_content, /<img src="missing\.png">/);
+  } finally {
+    await server.close();
+    await htmlApp.close();
+    restoreEnv("LAVISH_AXI_HTML_APP_API_URL", previousApiUrl);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/:key/share rejects cross-origin browser requests", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><title>x</title><h1>Private</h1>\n");
+
+  const requests = [];
+  const htmlApp = await startFakeHtmlApp(requests);
+  const previousApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
+  process.env.LAVISH_AXI_HTML_APP_API_URL = `http://127.0.0.1:${htmlApp.port}`;
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const shareRes = await fetch(`${base}/api/${session.key}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://attacker.example" },
+      body: JSON.stringify({}),
+    });
+    const body = await shareRes.json();
+
+    assert.equal(shareRes.status, 403);
+    assert.deepEqual(body, { error: "cross-origin share request rejected" });
+    assert.equal(requests.length, 0);
+  } finally {
+    await server.close();
+    await htmlApp.close();
+    restoreEnv("LAVISH_AXI_HTML_APP_API_URL", previousApiUrl);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/:key/share rejects requests without provenance headers", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><title>x</title><h1>Private</h1>\n");
+
+  const requests = [];
+  const htmlApp = await startFakeHtmlApp(requests);
+  const previousApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
+  process.env.LAVISH_AXI_HTML_APP_API_URL = `http://127.0.0.1:${htmlApp.port}`;
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const shareRes = await fetch(`${base}/api/${session.key}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const body = await shareRes.json();
+
+    assert.equal(shareRes.status, 403);
+    assert.deepEqual(body, { error: "cross-origin share request rejected" });
+    assert.equal(requests.length, 0);
+  } finally {
+    await server.close();
+    await htmlApp.close();
+    restoreEnv("LAVISH_AXI_HTML_APP_API_URL", previousApiUrl);
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -1198,6 +1692,241 @@ test("ending one of several sessions keeps the server running", async () => {
     await new Promise((resolve) => setTimeout(resolve, 150));
     const health = await fetch(`${base}/health`);
     assert.equal(health.status, 200);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a user-initiated end via the keyed route blocks a plain reopen but honors reopen: true", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  // A second, never-ended session keeps the server from self-shutting-down once the first
+  // session ends with nothing connected, so the later fetches below have a server to hit.
+  const keepAlive = path.join(dir, "keep-alive.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(keepAlive, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: keepAlive }),
+    });
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key, url: originalUrl } = await open.json();
+
+    // The browser chrome's plain "End session" hits this keyed route.
+    await fetch(`${base}/api/${key}/end`, { method: "POST" });
+
+    const blocked = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const blockedBody = await blocked.json();
+    assert.equal(blocked.status, 200);
+    assert.equal(blockedBody.status, "user-ended");
+    assert.equal(blockedBody.key, key);
+    assert.equal(blockedBody.url, originalUrl);
+
+    // A blocked open must not resurrect the session or wake a poll.
+    const stillEnded = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    assert.equal((await stillEnded.json()).status, "ended");
+
+    const reopened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact, reopen: true }),
+    });
+    const reopenedBody = await reopened.json();
+    assert.equal(reopenedBody.status, "opened");
+
+    const afterReopen = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    assert.equal((await afterReopen.json()).status, "waiting");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an agent cleanup after a user end still blocks a plain reopen", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const keepAlive = path.join(dir, "keep-alive.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(keepAlive, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: keepAlive }),
+    });
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key, url: originalUrl } = await open.json();
+
+    await fetch(`${base}/api/${key}/end`, { method: "POST" });
+    await fetch(`${base}/api/end`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+
+    const blocked = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const blockedBody = await blocked.json();
+    assert.equal(blocked.status, 200);
+    assert.equal(blockedBody.status, "user-ended");
+    assert.equal(blockedBody.key, key);
+    assert.equal(blockedBody.url, originalUrl);
+
+    const ended = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    const endedBody = await ended.json();
+    assert.equal(endedBody.status, "ended");
+    assert.equal(endedBody.ended_by, "user");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an agent-initiated end via the file-based route reopens normally without the reopen flag", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  // A second, never-ended session keeps the server from self-shutting-down once the first
+  // session ends with nothing connected, so the later fetches below have a server to hit.
+  const keepAlive = path.join(dir, "keep-alive.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(keepAlive, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: keepAlive }),
+    });
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+
+    // `lavish-axi end <file>` uses the file-based route - agent-initiated.
+    await fetch(`${base}/api/end`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+
+    const reopened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const reopenedBody = await reopened.json();
+    assert.equal(reopenedBody.status, "opened");
+
+    const afterReopen = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    assert.equal((await afterReopen.json()).status, "waiting");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("poll on an ended session reports who ended it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  // A second, never-ended session keeps the server from self-shutting-down once the first
+  // session ends with nothing connected, so the poll below has a server to hit.
+  const keepAlive = path.join(dir, "keep-alive.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(keepAlive, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: keepAlive }),
+    });
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    await fetch(`${base}/api/${key}/end`, { method: "POST" });
+
+    const polled = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    const body = await polled.json();
+    assert.equal(body.status, "ended");
+    assert.equal(body.ended_by, "user");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("send-and-end prompt submissions wake active polls with ended attribution", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+      const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`).then((res) => res.json());
+      assert.equal(await presence.next(), "listening");
+
+      const submitted = await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          domSnapshot: 'uid=1 h1 "Hello"',
+          endSession: true,
+          prompts: [{ prompt: "bye", tag: "message" }],
+        }),
+      });
+      assert.equal(submitted.status, 200);
+
+      const feedback = await poll;
+      assert.equal(feedback.status, "feedback");
+      assert.equal(feedback.session_ended, true);
+      assert.equal(feedback.ended_by, "user");
+      assert.equal(feedback.prompts.length, 1);
+
+      const ended = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+      const endedBody = await ended.json();
+      assert.equal(endedBody.status, "ended");
+      assert.equal(endedBody.ended_by, "user");
+    } finally {
+      await presence.close();
+    }
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
@@ -1533,10 +2262,11 @@ test("SSE agent-presence resets to waiting after ending and reopening a session"
       assert.equal(await presence.next(), "working");
 
       await fetch(`${base}/api/${key}/end`, { method: "POST" });
+      // The browser end above is user-initiated, so reopening requires the explicit opt-in.
       await fetch(`${base}/api/sessions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ file: artifact }),
+        body: JSON.stringify({ file: artifact, reopen: true }),
       });
     } finally {
       await presence.close();
@@ -1808,6 +2538,20 @@ test("layout gate curtain reuses the ended overlay card styling", async () => {
   assert.match(noGateHtml, /<body class="lavish">/);
   assert.match(noGateHtml, /id="layoutGateOverlay" hidden/);
   assert.match(noGateHtml, /"layoutGateEnabled":false/);
+});
+
+test("an open thread covers the chat composer instead of letting it paint through", async () => {
+  const css = await chromeCssSource();
+
+  // .composer is sticky with a z-index so it stays put above a long queue. The thread pane
+  // overlays the whole panel, so it must outrank the composer - otherwise the chat input and
+  // Send buttons paint on top of an open thread (they did, once these two changes met).
+  const composerZ = Number(css.match(/\.composer\s*\{[^}]*z-index:\s*(\d+)/s)[1]);
+  const threadZ = Number(css.match(/\.thread-pane\s*\{[^}]*z-index:\s*(\d+)/s)[1]);
+  assert.ok(threadZ > composerZ, `thread pane (z-index ${threadZ}) must outrank .composer (${composerZ})`);
+
+  // And the covered list is removed from the layout, so Tab cannot reach the hidden chat input.
+  assert.match(css, /\.panel\.thread-open\s+\.chat-pane\s*\{\s*display:\s*none;\s*\}/);
 });
 
 test("layout gate overlay is scoped to the artifact frame so it never covers the chat composer", async () => {
@@ -2290,4 +3034,137 @@ test("two concurrent streams on one session deliver each message exactly once (a
     await server.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+async function startFakeHtmlApp(requests, responseBody = null) {
+  const body = responseBody ?? {
+    site_id: "abc123",
+    url: "https://abc123.ht-ml.app/",
+    update_key: "uk_secret",
+    status: "active",
+  };
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      raw += chunk;
+    });
+    req.on("end", () => {
+      requests.push({
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        body: raw ? JSON.parse(raw) : null,
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  return {
+    port: typeof address === "object" && address ? address.port : 0,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}
+
+function restoreEnv(name, value) {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}
+
+test("chrome falls back to a default favicon and title when none are provided", () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+
+  assert.match(html, /<link rel="icon" href="data:image\/svg\+xml,/);
+  assert.match(html, /<title>Lavish Editor<\/title>/);
+});
+
+test("chrome adopts a favicon tag and tab title passed from the artifact", () => {
+  const faviconTag =
+    '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\'><text>🗂️</text></svg>">';
+  const html = createChromeHtml(
+    { key: "abc", file: "/tmp/artifact.html" },
+    { faviconTag, title: "Project Board · Lavish" },
+  );
+
+  assert.ok(html.includes(faviconTag), "artifact favicon tag is injected verbatim");
+  assert.match(html, /<title>Project Board · Lavish<\/title>/);
+});
+
+test("chrome tab title from the artifact is HTML-escaped", () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }, { title: "<script>alert(1)</script>" });
+
+  assert.doesNotMatch(html, /<title><script>/);
+  assert.match(html, /&lt;script&gt;/);
+});
+
+test("extractArtifactHead pulls a data-URI favicon and title from the artifact head", () => {
+  const artifact = `<!doctype html><html><head>
+    <title>  Weekly   Board  </title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗂️</text></svg>">
+    </head><body></body></html>`;
+  const { faviconTag, title } = extractArtifactHead(artifact);
+
+  assert.match(faviconTag, /rel="icon"/);
+  assert.match(faviconTag, /viewBox='0 0 100 100'/, "data-URI '>' chars must not truncate the tag");
+  assert.match(faviconTag, /<\/svg>">$/, "the full link tag is captured");
+  assert.equal(title, "Weekly Board");
+});
+
+test("extractArtifactHead handles shortcut icon and absolute hrefs", () => {
+  const artifact = `<head><link rel="shortcut icon" href="https://example.com/fav.ico"></head>`;
+  const { faviconTag } = extractArtifactHead(artifact);
+
+  assert.match(faviconTag, /href="https:\/\/example\.com\/fav\.ico"/);
+});
+
+test("extractArtifactHead reconstructs a clean tag and drops artifact-supplied attributes", () => {
+  const hostile = extractArtifactHead(
+    '<head><link rel="stylesheet icon" href="data:text/css,x" onload="steal()" onerror="steal()"></head>',
+  );
+  assert.equal(hostile.faviconTag, '<link rel="icon" href="data:text/css,x">');
+  assert.doesNotMatch(hostile.faviconTag, /onload|onerror|steal|stylesheet/i);
+
+  const breakout = extractArtifactHead(`<head><link rel='icon' href='data:image/png,x" onload="steal()'></head>`);
+  assert.doesNotMatch(breakout.faviconTag, /onload="/i);
+  assert.match(breakout.faviconTag, /^<link rel="icon" href="[^"]*">$/);
+  assert.match(breakout.faviconTag, /&quot;/);
+});
+
+test("extractArtifactHead falls back to the default for missing or relative favicons", () => {
+  const none = extractArtifactHead("<head><title>No icon</title></head>");
+  assert.match(none.faviconTag, /data:image\/svg\+xml/);
+  assert.equal(none.title, "No icon");
+
+  // Relative hrefs would not resolve against the chrome page, so they fall back.
+  const relative = extractArtifactHead('<head><link rel="icon" href="favicon.png"></head>');
+  assert.match(relative.faviconTag, /data:image\/svg\+xml/);
+});
+
+test("extractArtifactHead does not hang on an unterminated link tag", () => {
+  const start = process.hrtime.bigint();
+  const result = extractArtifactHead("<head><link " + '"'.repeat(60000));
+  const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+  assert.ok(elapsedMs < 1000, `expected linear scan, took ${elapsedMs}ms`);
+  assert.match(result.faviconTag, /data:image\/svg\+xml/);
+});
+
+test("extractArtifactHead reads the real href, not one hidden in another attribute", () => {
+  // A `data-href` (longer attribute name) must not be mistaken for `href`; the
+  // real, relative href should win and fall back to the default favicon.
+  const dataHref = extractArtifactHead(
+    '<head><link rel="icon" data-href="data:image/png,decoy" href="favicon.png"></head>',
+  );
+  assert.match(dataHref.faviconTag, /data:image\/svg\+xml/, "data-href decoy must not be adopted");
+
+  // A `href=` sequence inside another attribute's quoted value must not be
+  // adopted either; the genuine absolute href should be used.
+  const inValue = extractArtifactHead(
+    '<head><link rel="icon" title="see href=data:image/png,decoy" href="https://cdn.example.com/logo.png"></head>',
+  );
+  assert.equal(inValue.faviconTag, '<link rel="icon" href="https://cdn.example.com/logo.png">');
 });

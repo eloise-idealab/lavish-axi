@@ -1,5 +1,76 @@
 # Changelog
 
+## [0.1.40](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.39...lavish-axi-v0.1.40) (2026-07-11)
+
+
+### Features
+
+* edit Mermaid diagrams as whiteboards ([#166](https://github.com/kunchenguid/lavish-axi/issues/166)) ([94a181c](https://github.com/kunchenguid/lavish-axi/commit/94a181c2954d5ad49249d85681be61a0385ec47a))
+
+## [0.1.39](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.38...lavish-axi-v0.1.39) (2026-07-10)
+
+
+### Bug Fixes
+
+* **chrome:** add conversation empty state ([#155](https://github.com/kunchenguid/lavish-axi/issues/155)) ([6c81509](https://github.com/kunchenguid/lavish-axi/commit/6c81509c098cafc646c0c3d5fd7e4f462cf30cb1))
+* sync Mermaid diagrams with page themes ([#162](https://github.com/kunchenguid/lavish-axi/issues/162)) ([957eab4](https://github.com/kunchenguid/lavish-axi/commit/957eab4c11474a6ae15988a9b10d64ad08670a73))
+
+## [0.1.38](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.37...lavish-axi-v0.1.38) (2026-07-08)
+
+
+### Bug Fixes
+
+* make Send & End a top-level composer action ([#153](https://github.com/kunchenguid/lavish-axi/issues/153)) ([094bb40](https://github.com/kunchenguid/lavish-axi/commit/094bb40170e1718f3f8badbd627dbea6dd0b9536))
+
+## [0.1.37](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.36...lavish-axi-v0.1.37) (2026-07-07)
+
+
+### Features
+
+* **server:** surface artifact favicon and title on the Lavish tab ([#116](https://github.com/kunchenguid/lavish-axi/issues/116)) ([8b9f79f](https://github.com/kunchenguid/lavish-axi/commit/8b9f79f0c36523403cec8e05b89b500a2e8902bd))
+
+
+### Bug Fixes
+
+* **chrome:** keep composer visible with long feedback queues ([#146](https://github.com/kunchenguid/lavish-axi/issues/146)) ([a36aeb6](https://github.com/kunchenguid/lavish-axi/commit/a36aeb676eef161bd58b227a1e171fa2f6b5e071))
+
+## [0.1.36](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.35...lavish-axi-v0.1.36) (2026-07-03)
+
+
+### Features
+
+* **chrome:** add annotate/explore mode hotkey ([#138](https://github.com/kunchenguid/lavish-axi/issues/138)) ([9d3e4f2](https://github.com/kunchenguid/lavish-axi/commit/9d3e4f28132c969d0d1975ee526c3beb33a47259))
+* **sdk:** first-class zoomable, annotatable mermaid diagrams ([#124](https://github.com/kunchenguid/lavish-axi/issues/124)) ([e295450](https://github.com/kunchenguid/lavish-axi/commit/e2954503e11d334bf2135f7c64902ea59056ec33))
+
+## [0.1.35](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.34...lavish-axi-v0.1.35) (2026-07-02)
+
+
+### Bug Fixes
+
+* respect user-ended Lavish sessions ([#132](https://github.com/kunchenguid/lavish-axi/issues/132)) ([8ca248b](https://github.com/kunchenguid/lavish-axi/commit/8ca248bc4334316460566fccdd1ef33353b74626))
+
+## [0.1.34](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.33...lavish-axi-v0.1.34) (2026-07-02)
+
+
+### Bug Fixes
+
+* improve layout audit accuracy and warning persistence ([#129](https://github.com/kunchenguid/lavish-axi/issues/129)) ([6d91f4b](https://github.com/kunchenguid/lavish-axi/commit/6d91f4b5f4fe6c198b7599a71041bf25a9f295b2))
+
+## [0.1.33](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.32...lavish-axi-v0.1.33) (2026-07-01)
+
+
+### Features
+
+* add artifact export and hosted sharing ([#123](https://github.com/kunchenguid/lavish-axi/issues/123)) ([d7deba1](https://github.com/kunchenguid/lavish-axi/commit/d7deba16aec45a5752a853303f60b5c8dc45e535))
+* **cli:** add GitHub Copilot CLI session start hook support ([#106](https://github.com/kunchenguid/lavish-axi/issues/106)) ([0b3e28e](https://github.com/kunchenguid/lavish-axi/commit/0b3e28eae0a139540b7b274293cea98d49961dc4))
+* **cli:** tell agents to screenshot existing UI instead of describing it ([#113](https://github.com/kunchenguid/lavish-axi/issues/113)) ([2189f60](https://github.com/kunchenguid/lavish-axi/commit/2189f601b147062a69633381d893886a2201361b))
+* disclose ht-ml.app in share flows ([#126](https://github.com/kunchenguid/lavish-axi/issues/126)) ([cd6016a](https://github.com/kunchenguid/lavish-axi/commit/cd6016a3381ad713c5340db0bf8b53e36ed3ef9c))
+
+
+### Bug Fixes
+
+* **chrome:** center circular close button icons ([#125](https://github.com/kunchenguid/lavish-axi/issues/125)) ([47deaef](https://github.com/kunchenguid/lavish-axi/commit/47deaef107cac56deda4dcab5e9c6d903f9e42b4))
+
 ## [0.1.32](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.31...lavish-axi-v0.1.32) (2026-06-27)
 
 
