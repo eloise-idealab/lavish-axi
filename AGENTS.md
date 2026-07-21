@@ -85,6 +85,7 @@ State lives at `~/.lavish-axi/state.json` (`LAVISH_AXI_STATE_DIR`), shared acros
    Concurrent streams are capped at `maxStreamClients` (default 16); past the cap the server replies `503 busy` with a `Retry-After` header. An open stream counts as a live poll for presence and idle-shutdown purposes.
 9. The `/events/:key` SSE stream emits `agent-presence` states: `waiting` before any poll or stream has attached, `listening` while one is active, and `working` after a poll has delivered feedback and released.
    The chrome drives its waiting banner and working spinner from that state, but sends are always-on: a message is accepted and delivered in any presence state, so only a genuinely ended session disables the composer.
+   An agent reply (`POST /api/:key/agent-reply`, the CLI's `--agent-reply`) concludes the delivered-feedback work and returns presence to `waiting`, so the working spinner clears as soon as the agent answers instead of persisting until another poll attaches.
    `--agent-reply` (on `poll` or `stream`) posts a chat message into the session before waiting, rendered in the browser conversation panel via the same stream; on `stream`, `--reply-to <id>` threads that reply under a specific message.
    A `chat-sync` event re-broadcasts the transcript whenever the chat changes, so the chrome reconciles its optimistic bubbles against server-owned message ids.
 
