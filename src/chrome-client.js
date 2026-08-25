@@ -857,6 +857,8 @@ function syncChat(chat) {
   setMessages(chat);
   // baseline BEFORE renderChat so chips paint with correct read-state on load
   baselineSeenOnce();
+  // Mark the open thread seen BEFORE renderChat so the chip paints as read.
+  if (openThreadRootId) markThreadSeen(openThreadRootId);
   renderChat();
   if (openThreadRootId) {
     if (messagesById.has(openThreadRootId)) renderThread(openThreadRootId);

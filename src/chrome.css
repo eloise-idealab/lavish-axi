@@ -1058,6 +1058,13 @@ body.lavish {
 .reply-button:focus-visible {
   opacity: 1;
 }
+/* Reply is the only entry point for starting a thread, and a touch pointer has no hover to reveal
+   it with. Scoped to (hover: none) so a mouse pointer keeps the reveal-on-hover treatment. */
+@media (hover: none) {
+  .reply-button {
+    opacity: 1;
+  }
+}
 .bubble code {
   font-family: var(--font-mono);
   font-size: 0.92em;
@@ -1515,6 +1522,12 @@ body.layout-gate-active iframe#artifact {
     grid-template-rows: minmax(0, 1fr) calc(var(--dock-h) + env(safe-area-inset-bottom, 0px));
   }
   .frame {
+    /* The gate curtain lives inside .frame and carries .ended-overlay's z-index: 60, which on this
+       breakpoint outranks the fixed sheet (z-index: 30) the frame sits under. A stacking context
+       here keeps that 60 local, so the sheet and its scrim paint above the curtain and the chat
+       composer stays reachable - the invariant .layout-gate-overlay already claims. Scoped to this
+       breakpoint because .frame and .panel are non-overlapping grid columns on desktop. */
+    isolation: isolate;
     padding: 0 env(safe-area-inset-right, 0px) 0 env(safe-area-inset-left, 0px);
     background: var(--bg-bar);
   }

@@ -6731,3 +6731,78 @@ test("extractArtifactHead reads the real href, not one hidden in another attribu
   );
   assert.equal(inValue.faviconTag, '<link rel="icon" href="https://cdn.example.com/logo.png">');
 });
+
+// A rejecting async listener on the SSE emitter has no rejection handler, so under Node's default
+// --unhandled-rejections=throw one torn state read takes down the whole detached server and every
+// chrome, poll and stream attached to it. The dropped frame is the only acceptable loss.
+test("a chat-sync listener whose state read throws drops the frame and keeps the stream open", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-chat-sync-throw-"));
+  const artifact = path.join(dir, "report.html");
+  await writeFile(artifact, "<html><body><p>report</p></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  const { key } = await openSession(base, artifact);
+
+  // queuePrompts reads state directly, so only the SSE listener's findByKey tears: the POST still
+  // succeeds and still emits `chat-changed`, which is what puts the rejection on the emitter.
+  const realFindByKey = SessionStore.prototype.findByKey;
+  let tearState = false;
+  SessionStore.prototype.findByKey = async function findByKey(...args) {
+    if (tearState) throw new SyntaxError("Unexpected end of JSON input");
+    return realFindByKey.apply(this, args);
+  };
+
+  const queue = (text) =>
+    fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ prompts: [{ prompt: text, tag: "message" }] }),
+    });
+
+  const observed = { duringTear: null, health: null, afterTear: null };
+  const controller = new AbortController();
+  try {
+    const stream = await fetch(`${base}/events/${key}`, { signal: controller.signal });
+    const pending = [];
+    const frames = await collectSseFrames(
+      stream.body,
+      (received) => {
+        // The route registers its listeners before writing this first snapshot, so the frame is the
+        // proof that a `chat-changed` emit is observable at all - without it the POST below could
+        // reach zero listeners and the test would pass while exercising nothing.
+        if (pending.length === 0 && received.some((frame) => frame.event === "chat-sync")) {
+          tearState = true;
+          pending.push(
+            (async () => {
+              observed.duringTear = (await queue("during the tear")).status;
+              observed.health = (await fetch(`${base}/health`)).status;
+              tearState = false;
+              observed.afterTear = (await queue("after the tear")).status;
+            })().catch(() => {}),
+          );
+        }
+        return received.some(
+          (frame) =>
+            frame.event === "chat-sync" && (frame.data.chat || []).some((message) => message.text === "after the tear"),
+        );
+      },
+      10_000,
+    );
+    await Promise.all(pending);
+
+    assert.equal(observed.duringTear, 200, "the prompt that trips the listener must still be queued");
+    assert.equal(observed.health, 200, "a rejected listener must not take the server process down");
+    assert.equal(observed.afterTear, 200);
+
+    const synced = frames.filter((frame) => frame.event === "chat-sync");
+    const latest = synced.at(-1);
+    assert.ok(latest, "the same connection must still deliver chat-sync after the failure");
+    const texts = (latest.data.chat || []).map((message) => message.text);
+    assert.deepEqual(texts, ["during the tear", "after the tear"], JSON.stringify(texts));
+  } finally {
+    SessionStore.prototype.findByKey = realFindByKey;
+    controller.abort();
+    await server.close();
+    await rm(dir, { force: true, recursive: true });
+  }
+});

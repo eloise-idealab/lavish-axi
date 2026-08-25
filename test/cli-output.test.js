@@ -3510,3 +3510,70 @@ test("stream resolves the artifact past its own flags, and honors a -- separator
     await rm(stateDir, { force: true, recursive: true });
   }
 });
+
+// Every command that resolves its artifact with `firstPositionalArg` must read its boolean flags
+// from the same pre-`--` view. Scanning the raw array makes the two disagree about one token: the
+// path resolution treats it as the artifact name while the flag scan still honors it as a flag.
+test("boolean flags stop at the -- separator, like the positional resolution already does", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-separator-`);
+  const artifact = path.join(stateDir, "report.html");
+  await writeFile(artifact, "<html><body><p>report</p></body></html>");
+  const bin = fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url));
+
+  const streamUrls = [];
+  const server = createServer((req, res) => {
+    const url = new URL(req.url || "/", "http://localhost");
+    if (url.pathname === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, app: "lavish-axi", version: VERSION }));
+      return;
+    }
+    if (url.pathname === "/api/stream") {
+      streamUrls.push(url.search);
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end();
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+
+  const runStream = (args) =>
+    new Promise((resolve) => {
+      const child = spawn(process.execPath, [bin, "stream", ...args], {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: {
+          ...process.env,
+          LAVISH_AXI_STATE_DIR: stateDir,
+          LAVISH_AXI_PORT: String(port),
+          LAVISH_AXI_TELEMETRY: "0",
+        },
+      });
+      child.stdout.resume();
+      child.stderr.resume();
+      child.on("close", () => resolve());
+    });
+
+  try {
+    await runStream(["--once", artifact]);
+    assert.match(streamUrls.at(-1) || "", /once=1/, "a flag before the separator still applies");
+
+    await runStream([artifact, "--", "--once"]);
+    assert.doesNotMatch(
+      streamUrls.at(-1) || "",
+      /once=1/,
+      "past `--` the token is a positional, not the single-shot flag",
+    );
+  } finally {
+    await new Promise((resolve) => server.close(() => resolve()));
+    await rm(stateDir, { force: true, recursive: true });
+  }
+
+  // The same split in `open` and `share`, whose flag decisions are exported as pure functions.
+  assert.equal(shouldOpenBrowser(["report.html", "--no-open"], {}), false);
+  assert.equal(shouldOpenBrowser(["report.html", "--", "--no-open"], {}), true);
+  assert.equal(resolveShareRequest(["report.html", "--private"]).generatedPassword, true);
+  assert.equal(resolveShareRequest(["report.html", "--", "--private"]).generatedPassword, false);
+});

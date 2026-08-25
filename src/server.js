@@ -312,6 +312,37 @@ export async function serve({
   const verbose = debug || env.LAVISH_AXI_DEBUG === "1";
   const writeLog = typeof log === "function" ? log : (line) => process.stderr.write(`${line}\n`);
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
+  // An emit has no rejection handler, so an async listener that rejects - `sendChatSync` awaits a
+  // state read that rethrows a torn state.json - is an unhandled rejection, and under Node's
+  // default --unhandled-rejections=throw that tears down the detached server together with every
+  // attached chrome, poll and stream. The guard belongs on the emitter rather than inside any one
+  // listener so no present or future listener can reject into the void: the frame is dropped, the
+  // failure is reported, and the connection stays open.
+  const guardedEventListeners = new WeakMap();
+  const rawEventOn = events.on.bind(events);
+  const rawEventOff = events.off.bind(events);
+  const guardedEventListener = (event, listener) => {
+    let byEvent = guardedEventListeners.get(listener);
+    if (!byEvent) {
+      byEvent = new Map();
+      guardedEventListeners.set(listener, byEvent);
+    }
+    const existing = byEvent.get(event);
+    if (existing) return existing;
+    const report = (error) => writeLog(`[lavish] ${event} listener failed: ${error?.message || error}`);
+    const guarded = (...payload) => {
+      try {
+        const result = listener(...payload);
+        if (result && typeof result.then === "function") result.catch(report);
+      } catch (error) {
+        report(error);
+      }
+    };
+    byEvent.set(event, guarded);
+    return guarded;
+  };
+  events.on = (event, listener) => rawEventOn(event, guardedEventListener(event, listener));
+  events.off = (event, listener) => rawEventOff(event, guardedEventListeners.get(listener)?.get(event) || listener);
   if (networkWarning) writeLog(`[lavish] WARNING: ${networkWarning}`);
   let publicPort = port;
   let serverReady = false;

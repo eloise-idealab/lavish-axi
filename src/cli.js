@@ -288,8 +288,9 @@ async function openCommand(args) {
   await assertHtmlFile(file);
   const absolute = await canonicalFile(file);
   const selfPaintWarning = await selfPaintWarningForFile(absolute);
-  const noGate = args.includes("--no-gate");
-  const reopen = args.includes("--reopen");
+  const flags = flagTokens(args);
+  const noGate = flags.includes("--no-gate");
+  const reopen = flags.includes("--reopen");
   const baseUrl = await ensureServer({
     forceRestart: shouldForceRestartForLocalBuild(process.argv[1] || ""),
     reloadKey: sessionKey(absolute),
@@ -331,7 +332,7 @@ async function selfPaintWarningForFile(absolute) {
 }
 
 export function shouldOpenBrowser(args, env) {
-  return !args.includes("--no-open") && env.LAVISH_AXI_NO_OPEN !== "1";
+  return !flagTokens(args).includes("--no-open") && env.LAVISH_AXI_NO_OPEN !== "1";
 }
 
 async function pollCommand(args) {
@@ -408,7 +409,7 @@ async function streamCommand(args) {
       process.stderr.write(`${agentReplyUnthreadedText(replyTo)}\n`);
     }
   }
-  const once = args.includes("--once");
+  const once = flagTokens(args).includes("--once");
   const write = (line) => process.stdout.write(`${line}\n`);
   // Tell the server it's a single-shot consumer so it delivers exactly one user message and
   // requeues the rest of any batch, rather than writing the whole batch to a client that stops early.
@@ -989,8 +990,9 @@ async function unpublishShareSite(request) {
 // or the browser; this is the only place one is generated for a request, the sole exception being
 // `--unpublish`, which mints its own directly because that value is discarded rather than reported.
 export function resolveShareRequest(args) {
-  const unpublish = args.includes("--unpublish");
-  const generate = args.includes("--private");
+  const flags = flagTokens(args);
+  const unpublish = flags.includes("--unpublish");
+  const generate = flags.includes("--private");
   const explicitPassword = shareFlagValue(args, "--password");
   const siteId = shareFlagValue(args, "--site");
   const updateKey = shareFlagValue(args, "--update-key");
@@ -2005,6 +2007,14 @@ function pollResponseInterruptedError() {
     "Run `lavish-axi server --verbose` or inspect `~/.lavish-axi/server.log` (`LAVISH_AXI_STATE_DIR/server.log` when set) for server startup or crash diagnostics",
     "Re-run the last `lavish-axi poll <html-file>` command after the server is healthy",
   ]);
+}
+
+// The view of `args` every flag scan has to use. `firstPositionalArg` and `flagValue` both stop at
+// `--` and treat what follows as positional, so a boolean flag read from the raw array disagrees
+// with the path resolution about the same token.
+function flagTokens(args) {
+  const end = args.indexOf("--");
+  return end === -1 ? args : args.slice(0, end);
 }
 
 function firstPositionalArg(args, valueFlags = []) {
