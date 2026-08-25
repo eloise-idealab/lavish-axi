@@ -3,7 +3,12 @@ dist/
 coverage/
 .lavish/
 .lavish-axi/
+# Agent runtime state. `.omc/skills/**` is the one committable exception.
+/.omc/*
+!/.omc/skills/
 .DS_Store
 *.log
 .superpowers/
 package-lock.json
+.no-mistakes/evidence/
+/.planning/

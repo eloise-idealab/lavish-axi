@@ -1,12 +1,17 @@
+// Shared fake-DOM harness for the chrome client. Both chrome-client test files boot the real
+// src/chrome-client.js against this, so it must satisfy the WHOLE boot path, not just the
+// surface a given test touches - a second, thinner harness silently rots the moment the
+// client reaches for an API it does not implement.
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
+import { createChromeHtml } from "../../src/server.js";
+
 const sourceUrl = new URL("../../src/chrome-client.js", import.meta.url);
 
-// Deep-convert VM-realm values (Arrays, Maps, plain objects) into host-realm equivalents so that
-// assert.deepStrictEqual works across the vm sandbox boundary in tests.
-// We cannot use `instanceof Map` across vm realms, so we duck-type using constructor.name.
+// Deep-copies a value out of the vm realm so node:assert's deep-equality works across the sandbox
+// boundary. `instanceof Map` is false across realms, so Maps are duck-typed on constructor.name.
 function toHost(val) {
   if (val === null || val === undefined) return val;
   if (Array.isArray(val)) return Array.from(val, toHost);
@@ -23,6 +28,26 @@ function toHost(val) {
   return val;
 }
 
+// The subset of selector syntax the chrome client actually queries with: comma-separated groups of
+// one or more `.class` tokens, each optionally ending in a single `:not(.class)`. renderChat clears
+// old bubbles with ".bubble.user,.bubble.agent:not(.agent-working)", so a matcher that understands
+// only a lone `.class` silently matches nothing and the chat log accumulates every render.
+function matchesClassSelector(node, selector) {
+  if (typeof selector !== "string") return false;
+  const classes = String(node.className || "")
+    .split(/\s+/)
+    .filter(Boolean);
+  return selector.split(",").some((group) => {
+    const trimmed = group.trim();
+    if (!trimmed.startsWith(".")) return false;
+    const not = /:not\(\.([A-Za-z0-9_-]+)\)$/.exec(trimmed);
+    const excluded = not ? not[1] : null;
+    const required = (not ? trimmed.slice(0, not.index) : trimmed).split(".").filter(Boolean);
+    if (required.length === 0) return false;
+    return required.every((name) => classes.includes(name)) && (!excluded || !classes.includes(excluded));
+  });
+}
+
 /** @param {Function} fn */
 function wrapVmFn(fn) {
   return /** @type {typeof fn} */ (
@@ -32,17 +57,46 @@ function wrapVmFn(fn) {
   );
 }
 
-/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string }} HarnessSessionData */
+// The ids the served chrome page actually declares. The client reaches for these by id, so a page
+// that stopped declaring one would leave the corresponding feature silently dead behind an
+// `if (element)` guard - a harness that invents an element for any id would never notice.
+const servedChromeIds = new Set(
+  [...createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }).matchAll(/\sid="([^"]+)"/g)].map(
+    (match) => match[1],
+  ),
+);
+
+/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null }} HarnessSessionData */
 /** @type {HarnessSessionData} */
-const defaultSessionData = { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "i" };
+export const defaultSessionData = {
+  key: "abc",
+  file: "/tmp/artifact.html",
+  modeToggleHotkeyKey: "i",
+  attachmentAcceptedMime: ["image/png", "image/jpeg", "image/webp"],
+};
 
 export async function createChromeHarness({
-  fetchImpl = async () => ({ ok: true }),
+  fetchImpl = /** @type {(url?: any, init?: any) => Promise<any>} */ (
+    async () => ({ ok: true, json: async () => ({}) })
+  ),
   sessionData = defaultSessionData,
   artifactSrc = "",
+  storage = new Map(),
+  beginLoadResponses = [],
+  handoffResponses = [],
+  storedQueue = null,
+  // Opt-in frozen clock. `reloadChromeAfterServerRestart` waits on wall-clock deadlines, so a
+  // test that needs one to expire has to own `Date.now()` rather than sleep through it.
+  fakeClock = false,
+  // Opt-in phone-width viewport: installs a `window.matchMedia` whose single query answers the
+  // chrome's sheet breakpoint, with `setMobile` flipping it the way a resize would. Left off, the
+  // window has no matchMedia at all, which is the desktop the other tests run against.
+  mobile = false,
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
-  const storage = new Map();
+  // Seed sessionStorage before the client boots, to model a tab whose queue was
+  // already persisted by an earlier page load.
+  if (storedQueue) storage.set(`lavish-axi:queued:${sessionData.key}`, JSON.stringify(storedQueue));
   const postedToFrame = [];
   const postedToWhiteboard = [];
   const inlineWhiteboards = [];
@@ -52,8 +106,13 @@ export async function createChromeHarness({
   const elements = new Map();
   const timers = new Map();
   const srcLoads = [];
+  const beginRequests = [];
+  const artifactBeginRequests = [];
+  const focusLog = [];
+  let activeElement = null;
   let nextTimerId = 1;
   let reloadCount = 0;
+  let artifactRevision = 0;
 
   function fakeSetTimeout(fn, ms) {
     const timer = {
@@ -82,11 +141,14 @@ export async function createChromeHarness({
     if (elements.has(id)) return elements.get(id);
     const listeners = new Map();
     const classes = new Set();
-    const children = [];
     const el = {
       id,
       hidden: false,
       disabled: false,
+      checked: false,
+      indeterminate: false,
+      type: "",
+      className: "",
       value: "",
       innerHTML: "",
       textContent: "",
@@ -94,11 +156,9 @@ export async function createChromeHarness({
       scrollHeight: 0,
       scrolledIntoView: null,
       dataset: {},
+      children: [],
       onclick: null,
-      children,
-      get lastElementChild() {
-        return children.length ? children[children.length - 1] : null;
-      },
+      onchange: null,
       classList: {
         add(...names) {
           for (const name of names) classes.add(name);
@@ -126,60 +186,65 @@ export async function createChromeHarness({
       addEventListener(type, handler) {
         listeners.set(type, handler);
       },
+      dispatch(type, event = {}) {
+        const handler = listeners.get(type);
+        if (handler) handler(event);
+      },
+      querySelectorAll(selector) {
+        const matches = [];
+        const walk = (node) => {
+          for (const child of node.children || []) {
+            if (matchesClassSelector(child, selector)) matches.push(child);
+            walk(child);
+          }
+        };
+        walk(this);
+        return matches;
+      },
       querySelector(selector) {
-        if (selector !== "span") return null;
+        if (selector !== "span") return this.querySelectorAll(selector)[0] || null;
         const childId = `${id}:span`;
         if (!elements.has(childId)) element(childId);
         return elements.get(childId);
       },
-      // Supports the single compound selector renderChat uses to clear old bubbles:
-      // ".bubble.user,.bubble.agent:not(.agent-working)"
-      querySelectorAll(selector) {
-        if (selector === ".bubble.user,.bubble.agent:not(.agent-working)") {
-          return children.filter((child) => {
-            const cn = String(child.className || "");
-            if (!cn.includes("bubble")) return false;
-            if (cn.includes("user")) return true;
-            return cn.includes("agent") && !cn.includes("agent-working");
-          });
+      contains(node) {
+        let current = node;
+        while (current) {
+          if (current === this) return true;
+          current = current.parentElement;
         }
-        return [];
+        return false;
       },
       appendChild(child) {
+        // Appending a node that is already in the tree moves it, as the real DOM does; a harness
+        // that duplicated it would hide a re-append that reorders the panel.
+        const existing = child.parentElement;
+        if (existing) existing.children = existing.children.filter((node) => node !== child);
         child.parentElement = this;
+        this.children.push(child);
         this.lastAppendedChild = child;
-        children.push(child);
         return child;
       },
-      insertBefore(child, ref) {
-        child.parentElement = this;
-        this.lastAppendedChild = child;
-        if (ref) {
-          const idx = children.indexOf(ref);
-          if (idx !== -1) {
-            children.splice(idx, 0, child);
-          } else {
-            children.push(child);
-          }
-        } else {
-          children.push(child);
-        }
-        return child;
-      },
-      remove() {
-        const parent = this.parentElement;
-        if (parent && parent.children) {
-          const idx = parent.children.indexOf(this);
-          if (idx !== -1) parent.children.splice(idx, 1);
-        }
+      replaceChildren(...next) {
+        for (const child of this.children) child.parentElement = null;
+        this.children = [];
+        for (const child of next) this.appendChild(child);
       },
       click(event = {}) {
         this.clicked = true;
         if (typeof this.onclick === "function") return this.onclick(event);
         return undefined;
       },
+      remove() {
+        const parent = this.parentElement;
+        if (!parent) return;
+        parent.children = parent.children.filter((child) => child !== this);
+        this.parentElement = null;
+      },
       focus() {
         this.focused = true;
+        activeElement = this;
+        focusLog.push(this.id);
       },
       select() {},
       scrollIntoView(options) {
@@ -208,6 +273,18 @@ export async function createChromeHarness({
       postedToFrame.push(message);
     },
   };
+  // The served chrome nests these inside the composer, and drag handling reads
+  // that containment to decide whether a pointer actually left the drop target.
+  for (const childId of ["chatInput", "chatAttachments", "chatAttachInput", "chatAttach"]) {
+    element(childId).parentElement = element("chatComposer");
+  }
+  element("chatComposer").parentElement = element("panel");
+  element("panelScroll").parentElement = element("panel");
+  element("whiteboardOverlay").hidden = true;
+  element("layoutGateBypass").hidden = true;
+  element("shareDialog").hidden = true;
+  element("moreMenu").hidden = true;
+  element("warningsDrawer").hidden = true;
   const whiteboardFrame = element("whiteboardFrame");
   whiteboardFrame.contentWindow = {
     postMessage(message) {
@@ -215,10 +292,40 @@ export async function createChromeHarness({
     },
   };
 
+  const harnessFetch = async (url, init) => {
+    if (String(url).includes("/chrome-loads/begin")) {
+      beginRequests.push({ url, init });
+      if (handoffResponses.length > 0) return handoffResponses.shift();
+      return {
+        ok: true,
+        json: async () => ({ chrome_load_token: "harness-chrome-refresh", artifact_revision: artifactRevision }),
+      };
+    }
+    if (String(url).includes("/artifact-loads/begin")) {
+      artifactBeginRequests.push({ url, init });
+      if (beginLoadResponses.length > 0) return beginLoadResponses.shift();
+      artifactRevision += 1;
+      return {
+        ok: true,
+        json: async () => ({
+          artifact_revision: artifactRevision,
+          artifact_load_token: `harness-load-${artifactRevision}`,
+        }),
+      };
+    }
+    return fetchImpl(url, init);
+  };
+
+  let clockNow = Date.now();
   const context = {
+    // Test seam: src/chrome-client.js fills this in so the pure threading helpers can be
+    // exercised directly instead of only through rendered DOM.
+    __lavishTest: { threading: {} },
+    AbortController,
     clearTimeout: fakeClearTimeout,
     console,
-    fetch: fetchImpl,
+    ...(fakeClock ? { Date: { now: () => clockNow, parse: Date.parse } } : {}),
+    fetch: harnessFetch,
     location: {
       reload() {
         reloadCount += 1;
@@ -232,7 +339,6 @@ export async function createChromeHarness({
       },
       revokeObjectURL() {},
     },
-    __lavishTest: { threading: {} },
     EventSource: class FakeEventSource {
       constructor(url) {
         this.url = url;
@@ -246,7 +352,13 @@ export async function createChromeHarness({
     },
     document: {
       body: element("body"),
+      get activeElement() {
+        return activeElement;
+      },
       getElementById(id) {
+        // Answer only for ids the served page declares, so an id the client and the page disagree
+        // on fails here the way it would go dead in a browser.
+        if (!servedChromeIds.has(id) && !elements.has(id)) return null;
         return element(id);
       },
       addEventListener(type, handler, capture) {
@@ -274,27 +386,80 @@ export async function createChromeHarness({
       },
     },
     window: {
+      clearTimeout: fakeClearTimeout,
+      setTimeout: fakeSetTimeout,
       addEventListener(type, handler) {
         if (!windowListeners.has(type)) windowListeners.set(type, []);
         windowListeners.get(type).push(handler);
       },
     },
   };
+  const mediaQueries = [];
+  if (mobile) {
+    context.window.matchMedia = (query) => {
+      const list = {
+        media: query,
+        matches: true,
+        changeHandlers: [],
+        addEventListener(type, handler) {
+          if (type === "change") this.changeHandlers.push(handler);
+        },
+      };
+      mediaQueries.push(list);
+      return list;
+    };
+  }
 
   vm.runInNewContext(source, context, { filename: "chrome-client.js" });
+  await flushPromises();
+  if (artifactSrc) frame.dispatch("load");
+
+  function frameLoadToken() {
+    const match = String(frame.src).match(/[?&]artifact_load_token=([^&]+)/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }
 
   return {
     element,
+    threading() {
+      const raw = context.__lavishTest.threading;
+      const wrapped = /** @type {Record<string, Function>} */ ({});
+      for (const k of Object.keys(raw)) {
+        const v = raw[k];
+        wrapped[k] = typeof v === "function" ? wrapVmFn(v) : v;
+      }
+      return wrapped;
+    },
+    threadingOpen(id) {
+      return context.__lavishTest.openThread(id);
+    },
+    threadingReplyTo(id, text) {
+      return context.__lavishTest.setThreadReplyTarget(id, text);
+    },
+    threadingBuildBubble(message, opts) {
+      return context.__lavishTest.buildBubble(message, opts);
+    },
+    threadingOrdered() {
+      return toHost(context.__lavishTest.orderedMessages());
+    },
+    threadingUnread(rootId) {
+      return context.__lavishTest.threadUnreadCount(rootId);
+    },
+    // The joined innerHTML of every direct child of #chatLog.
+    chatLogHtml() {
+      return element("chatLog")
+        .children.map((c) => c.innerHTML || "")
+        .join("");
+    },
     frame,
     postedToFrame,
     postedToWhiteboard,
-    eventSource() {
-      assert.equal(eventSources.length, 1);
-      return eventSources[0];
-    },
     createInlineWhiteboard() {
       const posted = [];
+      // A real inline whiteboard frame is created by the SDK inside the
+      // artifact document, so its window's parent is the artifact window.
       const source = {
+        parent: frame.contentWindow,
         postMessage(message) {
           posted.push(message);
         },
@@ -303,9 +468,32 @@ export async function createChromeHarness({
       inlineWhiteboards.push(whiteboard);
       return whiteboard;
     },
+    // A window that is not a child of the artifact frame: an attacker page that
+    // framed this chrome, or one holding a window.open handle to it. Such a
+    // window is top-level, so its `parent` is itself.
+    createForeignWindow() {
+      const posted = [];
+      /** @type {any} */
+      const source = {
+        postMessage(message) {
+          posted.push(message);
+        },
+      };
+      source.parent = source;
+      return { source, posted };
+    },
+    eventSource() {
+      assert.equal(eventSources.length, 1);
+      return eventSources[0];
+    },
     sendFrameMessage(data) {
       const handlers = windowListeners.get("message") || [];
       assert.ok(handlers.length > 0, "chrome-client registered a message handler");
+      // Sent verbatim: what the test writes is what the chrome receives. Callers
+      // modeling a genuine SDK message must stamp artifact_load_token themselves
+      // (chrome.artifactLoadToken()) - the real SDK does on every postMessage, and
+      // a harness that patches it in silently passes even when the real send omits
+      // the token (that is exactly how the token-less attachment upload shipped).
       for (const handler of handlers) handler({ source: frame.contentWindow, data });
     },
     sendWhiteboardMessage(data) {
@@ -336,46 +524,73 @@ export async function createChromeHarness({
       for (const { handler } of handlers) handler(event);
       return event;
     },
+    dispatchDocumentEvent(type, eventProps = {}) {
+      const event = {
+        defaultPrevented: false,
+        ...eventProps,
+        preventDefault() {
+          this.defaultPrevented = true;
+        },
+      };
+      for (const { handler } of documentListeners.get(type) || []) handler(event);
+      return event;
+    },
     queued() {
       return JSON.parse(storage.get("lavish-axi:queued:abc") || "[]");
     },
     reloadCount() {
       return reloadCount;
     },
+    focusLog,
+    storage,
+    warningRows() {
+      return element("warningsList").children.filter((child) => String(child.className).startsWith("warning-row"));
+    },
+    dispatchDocumentMousedown(target) {
+      for (const { handler } of documentListeners.get("mousedown") || []) handler({ target });
+    },
     runTimers,
+    advanceClock(ms) {
+      clockNow += ms;
+    },
     srcLoads,
-    threading() {
-      const raw = context.__lavishTest.threading;
-      const wrapped = /** @type {Record<string, Function>} */ ({});
-      for (const k of Object.keys(raw)) {
-        const v = raw[k];
-        wrapped[k] = typeof v === "function" ? wrapVmFn(v) : v;
+    beginRequests,
+    artifactBeginRequests,
+    artifactLoadToken: frameLoadToken,
+    mediaQueries,
+    setMobile(matches) {
+      for (const list of mediaQueries) {
+        list.matches = matches;
+        for (const handler of list.changeHandlers) handler({ matches });
       }
-      return wrapped;
     },
-    threadingOpen(id) {
-      return context.__lavishTest.openThread(id);
+    // A pointer gesture on the conversation dock, as the browser would deliver it: one pointer
+    // id from down to up, with the y travel the test names.
+    dragDock(fromY, toY, { pointerId = 1 } = {}) {
+      const head = element("panelHead");
+      head.dispatch("pointerdown", { pointerId, clientY: fromY, button: 0 });
+      head.dispatch("pointermove", { pointerId, clientY: fromY + (toY - fromY) / 2 });
+      head.dispatch("pointermove", { pointerId, clientY: toY });
+      head.dispatch("pointerup", { pointerId, clientY: toY });
+      // A completed pointer sequence is followed by a click on the same target.
+      head.dispatch("click", {});
     },
-    threadingReplyTo(id, text) {
-      return context.__lavishTest.setThreadReplyTarget(id, text);
-    },
-    threadingBuildBubble(message, opts) {
-      return context.__lavishTest.buildBubble(message, opts);
-    },
-    threadingOrdered() {
-      return toHost(context.__lavishTest.orderedMessages());
-    },
-    threadingUnread(rootId) {
-      return context.__lavishTest.threadUnreadCount(rootId);
-    },
-    // Returns the joined innerHTML of every direct child of #chatLog, so tests
-    // can assert on rendered chip markup (e.g. /thread-chip unread/).
-    chatLogHtml() {
-      return element("chatLog")
-        .children.map((c) => c.innerHTML || "")
-        .join("");
+    cancelDock(fromY, moveY, cancelY, { pointerId = 1 } = {}) {
+      const head = element("panelHead");
+      head.dispatch("pointerdown", { pointerId, clientY: fromY, button: 0 });
+      head.dispatch("pointermove", { pointerId, clientY: moveY });
+      head.dispatch("pointercancel", { pointerId, clientY: cancelY });
     },
   };
+}
+
+// One whole begin-load attempt that fails: the request plus both in-call transport retries.
+export async function exhaustOneBeginLoadAttempt(chrome) {
+  await flushPromises();
+  chrome.runTimers(100);
+  await flushPromises();
+  chrome.runTimers(300);
+  await flushPromises();
 }
 
 export function flushPromises() {
