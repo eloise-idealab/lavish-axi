@@ -6018,16 +6018,9 @@ test("layout gate curtain reuses the ended overlay card styling", async () => {
   assert.match(noGateHtml, /"layoutGateEnabled":false/);
 });
 
-test("an open thread covers the chat composer instead of letting it paint through", async () => {
-  const css = await chromeCssSource();
-
-  // .composer is sticky with a z-index so it stays put above a long queue. The thread pane
-  // overlays the whole panel, so it must outrank the composer - otherwise the chat input and
-  // Send buttons paint on top of an open thread (they did, once these two changes met).
-  const composerZ = Number(css.match(/\.composer\s*\{[^}]*z-index:\s*(\d+)/s)[1]);
-  const threadZ = Number(css.match(/\.thread-pane\s*\{[^}]*z-index:\s*(\d+)/s)[1]);
-  assert.ok(threadZ > composerZ, `thread pane (z-index ${threadZ}) must outrank .composer (${composerZ})`);
-});
+// Whether an open thread actually covers the chat composer is a paint-order question no fake DOM
+// can answer, so it is measured against a real browser in test/mobile-conversation-sheet.browser.test.js
+// ("the thread pane owns the composer's pixels"), on both the phone sheet and the desktop panel.
 
 test("layout gate overlay is scoped to the artifact frame so it never covers the chat composer", () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });

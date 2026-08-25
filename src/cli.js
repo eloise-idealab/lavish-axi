@@ -41,6 +41,13 @@ import { generateSharePassword } from "./share-password.js";
 import { initDefaultTelemetry } from "./telemetry.js";
 
 const SHARE_VALUE_FLAGS = ["--password", "--token", "--site", "--update-key"];
+// Every `stream` flag that consumes the token after it. `firstPositionalArg` and the `flagValue`
+// reads below share these names, so a new value flag cannot be added to one and missed by the
+// other - which is what makes `stream --agent-reply "on it" review.html` resolve the artifact
+// rather than the reply text.
+const STREAM_AGENT_REPLY_FLAG = "--agent-reply";
+const STREAM_REPLY_TO_FLAG = "--reply-to";
+const STREAM_VALUE_FLAGS = [STREAM_AGENT_REPLY_FLAG, STREAM_REPLY_TO_FLAG];
 const COMMANDS = new Set([
   "open",
   "poll",
@@ -384,15 +391,15 @@ async function pollCommand(args) {
 // for tests / harnesses that cannot keep a long-lived process), and --agent-reply to post a reply
 // (optionally threaded with --reply-to <id>) before streaming.
 async function streamCommand(args) {
-  const file = args[0];
+  const file = firstPositionalArg(args, STREAM_VALUE_FLAGS);
   if (!file) {
     throw new AxiError("HTML file path is required", "VALIDATION_ERROR", ["Run `lavish-axi stream <html-file>`"]);
   }
   const absolute = await canonicalFile(file);
   const baseUrl = await ensureServer();
-  const agentReply = flagValue(args, "--agent-reply");
+  const agentReply = flagValue(args, STREAM_AGENT_REPLY_FLAG);
   if (agentReply) {
-    const replyTo = flagValue(args, "--reply-to");
+    const replyTo = flagValue(args, STREAM_REPLY_TO_FLAG);
     const posted = await postJson(`${baseUrl}/api/${sessionKey(absolute)}/agent-reply`, {
       text: agentReply,
       ...(replyTo ? { reply_to: replyTo } : {}),

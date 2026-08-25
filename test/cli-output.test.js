@@ -3458,3 +3458,55 @@ test("createShareUnpublishOutput separates the immediate content swap from the l
   assert.match(output.next_step, /readable without the password/i);
   assert.doesNotMatch(output.next_step, /no visitor can read the old content/i);
 });
+
+// `stream` resolves its artifact the way every other file-taking command does. Before this, it
+// read args[0] verbatim, so the natural `stream --once report.html` ordering the README's flag
+// rows invite made it realpath("--once") and die on an ENOENT naming a path nobody typed.
+test("stream resolves the artifact past its own flags, and honors a -- separator", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-stream-args-`);
+  const bin = fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url));
+  // A path that does not exist: canonicalFile fails BEFORE any server is contacted, and the error
+  // names whichever token the command decided was the artifact - which is exactly what we measure.
+  const missing = path.join(stateDir, "review-fixture.html");
+  const run = (args) =>
+    spawnSync(process.execPath, [bin, "stream", ...args], {
+      cwd: stateDir,
+      encoding: "utf8",
+      env: { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_TELEMETRY: "0" },
+      timeout: 30_000,
+    });
+
+  try {
+    for (const args of [
+      ["--once", missing],
+      ["--reply-to", "msg-7", "--agent-reply", "on it", missing],
+      ["--agent-reply=on it", "--once", missing],
+      [missing, "--once"],
+    ]) {
+      const result = run(args);
+      const output = `${result.stdout || ""}${result.stderr || ""}`;
+      assert.notEqual(result.status, 0, `${args.join(" ")} should fail on the missing artifact\n${output}`);
+      assert.match(output, /review-fixture\.html/, `${args.join(" ")} must resolve the artifact\n${output}`);
+      for (const token of ["--once", "--reply-to", "--agent-reply", "msg-7", "on it"]) {
+        assert.ok(
+          !output.includes(`'${token}`) && !output.includes(`/${token}`),
+          `${args.join(" ")} must not treat ${token} as the artifact path\n${output}`,
+        );
+      }
+    }
+
+    // A `--` separator is what lets an artifact whose own name starts with a dash be named at all.
+    const dashed = run(["--once", "--", "-dash-fixture.html"]);
+    const dashedOutput = `${dashed.stdout || ""}${dashed.stderr || ""}`;
+    assert.notEqual(dashed.status, 0);
+    assert.match(dashedOutput, /-dash-fixture\.html/, dashedOutput);
+
+    // Without it, that same token is a flag, so no artifact was named at all.
+    const unseparated = run(["--once", "-dash-fixture.html"]);
+    const unseparatedOutput = `${unseparated.stdout || ""}${unseparated.stderr || ""}`;
+    assert.notEqual(unseparated.status, 0);
+    assert.match(unseparatedOutput, /HTML file path is required/, unseparatedOutput);
+  } finally {
+    await rm(stateDir, { force: true, recursive: true });
+  }
+});

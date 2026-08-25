@@ -226,6 +226,42 @@ test(
       assert.equal(g.documentScrollable, false);
     }
 
+    // Hit-tests the pixels the chat composer occupied before a thread opened. Being invisible is
+    // not enough: the thread pane has to own those pixels, or the sticky composer paints through
+    // it and the chat input stays clickable and tabbable behind the overlay.
+    function assertComposerOccludedByThread(box, label) {
+      const probe = evaluate(`() => {
+        const box = ${JSON.stringify(box)};
+        const thread = document.getElementById("threadPane");
+        const composer = document.getElementById("chatComposer");
+        const midX = Math.round((box.left + box.right) / 2);
+        const points = [
+          [midX, Math.round((box.top + box.bottom) / 2)],
+          [midX, box.bottom - 2],
+          [box.left + 2, box.top + 2],
+        ];
+        return JSON.stringify({
+          hits: points.map(([x, y]) => {
+            const el = document.elementFromPoint(x, y);
+            return {
+              x,
+              y,
+              inThread: Boolean(el && thread.contains(el)),
+              inComposer: Boolean(el && composer.contains(el)),
+            };
+          }),
+          chatInputVisible: document.getElementById("chatInput").checkVisibility(),
+          sendVisible: document.getElementById("send").checkVisibility(),
+        });
+      }`);
+      for (const hit of probe.hits) {
+        assert.equal(hit.inComposer, false, `${label}: composer still owns ${JSON.stringify(hit)}`);
+        assert.equal(hit.inThread, true, `${label}: the thread must own the composer's pixels ${JSON.stringify(hit)}`);
+      }
+      assert.equal(probe.chatInputVisible, false, `${label}: the chat input is unreachable behind the thread`);
+      assert.equal(probe.sendVisible, false, `${label}: Send is unreachable behind the thread`);
+    }
+
     function assertDocked(g) {
       assert.equal(g.open, false);
       assert.equal(g.panelPosition, "fixed");
@@ -268,12 +304,14 @@ test(
 
       evaluate('() => { document.getElementById("panelHead").click(); return "ok"; }');
       wait(500);
-      assertSheetUsable(geometry());
+      const phoneSheet = geometry();
+      assertSheetUsable(phoneSheet);
 
       // An open thread covers the chat, but never the dock: the dock is the only control that
       // raises the sheet back up, so losing it strands a collapsed sheet closed forever.
       evaluate('() => { document.getElementById("panel").classList.add("thread-open"); return "ok"; }');
-      wait(300);
+      wait(600);
+      assertComposerOccludedByThread(phoneSheet.composer, "phone sheet");
       let t = evaluate(THREAD_GEOMETRY);
       assert.notEqual(t.chatPaneDisplay, "none", `phone keeps the dock's pane laid out: ${JSON.stringify(t)}`);
       assert.equal(t.scrollDisplay, "none", "the thread covers the chat list");
@@ -373,7 +411,8 @@ test(
       assert.equal(g.frame.right, g.panel.left, "artifact and panel sit side by side");
 
       evaluate('() => { document.getElementById("panel").classList.add("thread-open"); return "ok"; }');
-      wait(300);
+      wait(600);
+      assertComposerOccludedByThread(g.composer, "desktop panel");
       const desktopThread = evaluate(THREAD_GEOMETRY);
       assert.equal(desktopThread.chatPaneDisplay, "none", "desktop still drops the whole covered pane");
       assert.equal(desktopThread.thread.top, desktopThread.panel.top, "desktop's thread owns the full panel");
