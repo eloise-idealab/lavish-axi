@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createChromeHarness, flushPromises } from "./helpers/chrome-harness.js";
+import { createChromeHarness, defaultSessionData, flushPromises } from "./helpers/chrome-harness.js";
 
 async function threading() {
   const chrome = await createChromeHarness();
@@ -165,6 +165,97 @@ test("Send button stays active and still posts while the agent is working (chang
     "message sent while working is echoed into the transcript",
   );
   assert.equal(chrome.queued().length, 1, "message sent while working is queued for delivery");
+
+  // Ending the session is the ONLY thing that closes sending: no later poll can carry a batch.
+  chrome.eventSource().listeners.get("ended")({ data: JSON.stringify({ ended_by: "user" }) });
+  assert.equal(chrome.element("send").disabled, true, "an ended session disables Send");
+  assert.equal(chrome.element("sendAndEnd").disabled, true, "an ended session disables Send & End");
+});
+
+test("persisted chat history renders on boot, threads and all", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: {
+      ...defaultSessionData,
+      initialChat: [
+        { id: "root1", role: "agent", text: "Persisted root", at: 1 },
+        { id: "r1", role: "agent", text: "Persisted reply", reply_to: "root1", at: 2 },
+        { id: "u1", role: "user", text: "Persisted question", at: 3 },
+      ],
+    },
+  });
+
+  assert.deepEqual(
+    chrome.threadingOrdered().map((m) => m.id),
+    ["root1", "r1", "u1"],
+    "the bootstrapped transcript is the live model, not just markup",
+  );
+  const html = chrome.chatLogHtml();
+  assert.ok(html.includes("Persisted root"), "a persisted root renders");
+  assert.ok(html.includes("Persisted question"), "a persisted user message renders");
+  assert.ok(!html.includes("Persisted reply"), "a persisted reply collapses into its thread");
+  assert.ok(html.includes("thread-chip"), "the persisted thread gets a chip");
+  assert.equal(
+    chrome.threadingUnread("root1"),
+    0,
+    "history the user has already had a chance to read is not counted unread",
+  );
+});
+
+test("the served chrome carries a thread pane the client can open and close", async () => {
+  const chrome = await createChromeHarness();
+
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [
+        { id: "root1", role: "agent", text: "Root message", at: 1 },
+        { id: "r1", role: "agent", text: "Threaded reply", reply_to: "root1", at: 2 },
+      ],
+    }),
+  });
+  assert.equal(chrome.element("panel").classList.contains("thread-open"), false);
+
+  chrome.threadingOpen("root1");
+  assert.equal(chrome.element("panel").classList.contains("thread-open"), true);
+  const threadHtml = chrome
+    .element("threadChat")
+    .children.map((c) => c.innerHTML || "")
+    .join("");
+  assert.ok(threadHtml.includes("Root message"), "the thread shows its root");
+  assert.ok(threadHtml.includes("Threaded reply"), "the thread shows its replies");
+  assert.equal(chrome.element("threadTitle").textContent.startsWith("1 reply"), true);
+
+  chrome.element("threadBack").dispatch("click", {});
+  assert.equal(chrome.element("panel").classList.contains("thread-open"), false);
+  assert.equal(chrome.element("backBadge").hidden, true);
+});
+
+test("a docked phone sheet takes the open thread out of reach with the rest of it", async () => {
+  const chrome = await createChromeHarness({ mobile: true });
+
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root message", at: 1 }] }),
+  });
+  // Raise the sheet, then open a thread inside it.
+  chrome.element("panelHead").dispatch("click", {});
+  chrome.threadingOpen("root1");
+  assert.equal(chrome.element("body").classList.contains("sheet-open"), true);
+  assert.equal(Boolean(chrome.element("threadPane").inert), false, "an open thread on a raised sheet is reachable");
+
+  // Lowering the sheet leaves only the dock on screen: the thread pane goes off-screen with the
+  // list and composer, so it must leave the tab order with them.
+  chrome.element("panelScrim").dispatch("click", {});
+  assert.equal(chrome.element("body").classList.contains("sheet-open"), false);
+  assert.equal(chrome.element("threadPane").inert, true, "a docked sheet's thread pane is unreachable");
+  assert.equal(Boolean(chrome.element("panelScroll").inert), true);
+  assert.equal(Boolean(chrome.element("chatComposer").inert), true);
+
+  // The dock is still the control that raises it again, thread open or not.
+  assert.equal(Boolean(chrome.element("panelHead").inert), false, "the dock never leaves the tab order");
+  assert.equal(chrome.element("panelToggle")["aria-label"], "Show conversation");
+  chrome.element("panelHead").dispatch("click", {});
+  assert.equal(chrome.element("body").classList.contains("sheet-open"), true);
+  assert.equal(chrome.element("panel").classList.contains("thread-open"), true, "raising the sheet keeps the thread");
+  assert.equal(Boolean(chrome.element("threadPane").inert), false);
 });
 
 test("formatRelativeTime renders coarse buckets", async () => {

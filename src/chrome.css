@@ -1815,6 +1815,24 @@ body.layout-gate-active iframe#artifact {
 .panel.thread-open .chat-pane {
   display: none;
 }
+/* Must follow the desktop rule above: same specificity, so source order is what decides. The dock
+   lives inside .chat-pane and is the only control that raises a collapsed sheet, so a phone keeps
+   that pane laid out for the dock alone and starts the thread below it. */
+@media (max-width: 860px) {
+  .panel.thread-open .chat-pane {
+    display: flex;
+  }
+  .panel.thread-open .panel-scroll,
+  .panel.thread-open .chat-pane > .composer {
+    display: none;
+  }
+  .panel.thread-open .thread-pane {
+    top: var(--dock-h);
+  }
+  body:not(.sheet-open) .panel.thread-open .thread-pane {
+    top: calc(var(--dock-h) + env(safe-area-inset-bottom, 0px));
+  }
+}
 @keyframes thread-slide-in {
   from {
     transform: translateX(100%);

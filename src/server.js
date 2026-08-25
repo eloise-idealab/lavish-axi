@@ -808,12 +808,14 @@ export async function serve({
               return;
             }
             finishFeedbackDelivery(key, batch);
-            const feedback = /** @type {{ prompts?: any[], layout_warnings?: any[], dom_snapshot?: string }} */ (batch);
+            const feedback = /** @type {{ prompts?: any[], artifact_failures?: any[], dom_snapshot?: string }} */ (
+              batch
+            );
             const prompts = Array.isArray(feedback.prompts) ? feedback.prompts : [];
-            const layoutWarnings = Array.isArray(feedback.layout_warnings) ? feedback.layout_warnings : [];
+            const artifactFailures = Array.isArray(feedback.artifact_failures) ? feedback.artifact_failures : [];
             const dom = feedback.dom_snapshot || "";
-            // One SSE frame per user message keeps the "one subagent per message" contract; layout
-            // warnings (and any non-message prompts) ride along on the batch's first frame.
+            // One SSE frame per user message keeps the "one subagent per message" contract; fatal
+            // artifact failures (and any non-message prompts) ride along on the batch's first frame.
             const messages = prompts.filter((p) => p && p.tag === "message" && p.prompt);
             const extras = prompts.filter((p) => !(p && p.tag === "message" && p.prompt));
             if (once && messages.length > 0) {
@@ -822,32 +824,32 @@ export async function serve({
               const [first, ...rest] = messages;
               writeFrame("message", {
                 prompts: [first, ...extras],
-                ...(layoutWarnings.length > 0 ? { layout_warnings: layoutWarnings } : {}),
+                ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
                 dom_snapshot: dom,
                 id: first.id || "",
                 ...(first.reply_to ? { reply_to: first.reply_to } : {}),
               });
+              stopped = true;
               // Requeue the tail WITH the batch's dom_snapshot so the next consumer keeps the DOM
               // context that produced those messages. The restore path preserves the ids already
               // minted for these prompts, so the chrome's optimistic bubbles still reconcile.
               if (rest.length > 0) {
                 await restoreClosedFeedback(key, { status: "feedback", prompts: rest, dom_snapshot: dom });
               }
-              stopped = true;
               if (!res.writableEnded) res.end();
               return;
             }
-            if (messages.length === 0 && (extras.length > 0 || layoutWarnings.length > 0)) {
+            if (messages.length === 0 && (extras.length > 0 || artifactFailures.length > 0)) {
               writeFrame("message", {
                 prompts: extras,
-                ...(layoutWarnings.length > 0 ? { layout_warnings: layoutWarnings } : {}),
+                ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
                 dom_snapshot: dom,
               });
             } else {
               messages.forEach((message, index) => {
                 writeFrame("message", {
                   prompts: [message, ...(index === 0 ? extras : [])],
-                  ...(index === 0 && layoutWarnings.length > 0 ? { layout_warnings: layoutWarnings } : {}),
+                  ...(index === 0 && artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
                   dom_snapshot: index === 0 ? dom : "",
                   id: message.id || "",
                   ...(message.reply_to ? { reply_to: message.reply_to } : {}),

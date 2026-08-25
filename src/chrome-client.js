@@ -194,6 +194,7 @@ let openThreadRootId = "";
 /** @type {Map<string, number>} */
 const seenReplyCount = new Map();
 let seenBaselined = false;
+const threadPane = /** @type {HTMLDivElement} */ (document.getElementById("threadPane"));
 const threadChat = /** @type {HTMLDivElement} */ (document.getElementById("threadChat"));
 const threadTitle = /** @type {HTMLSpanElement} */ (document.getElementById("threadTitle"));
 const threadBack = /** @type {HTMLButtonElement} */ (document.getElementById("threadBack"));
@@ -1098,8 +1099,13 @@ function applySheetState() {
   const docked = mobile && !open;
   panelScroll.inert = ended || docked;
   chatComposer.inert = ended || docked;
+  if (threadPane) threadPane.inert = docked;
   const activeElement = document.activeElement;
-  if (docked && activeElement && (panelScroll.contains(activeElement) || chatComposer.contains(activeElement))) {
+  const inHiddenHalf =
+    panelScroll.contains(activeElement) ||
+    chatComposer.contains(activeElement) ||
+    Boolean(threadPane && threadPane.contains(activeElement));
+  if (docked && activeElement && inHiddenHalf) {
     panelToggle.focus();
   }
   panelToggle.setAttribute("aria-expanded", open ? "true" : "false");

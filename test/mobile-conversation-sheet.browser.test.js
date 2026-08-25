@@ -60,6 +60,26 @@ const REPLIES = [
   "Address lookup falls back to manual entry when the postcode service is down.",
 ];
 
+// The thread pane covers the chat pane. Desktop drops the covered pane outright; a phone cannot,
+// because the dock it contains is the only control that raises a collapsed sheet.
+const THREAD_GEOMETRY = `() => {
+  const rect = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top), bottom: Math.round(r.bottom), left: Math.round(r.left), right: Math.round(r.right), height: Math.round(r.height), width: Math.round(r.width) }; };
+  const panel = document.getElementById("panel");
+  const head = document.getElementById("panelHead");
+  const toggle = document.getElementById("panelToggle");
+  return JSON.stringify({
+    viewport: { width: innerWidth, height: innerHeight },
+    open: document.body.classList.contains("sheet-open"),
+    chatPaneDisplay: getComputedStyle(document.getElementById("chatPane")).display,
+    scrollDisplay: getComputedStyle(document.getElementById("panelScroll")).display,
+    composerDisplay: getComputedStyle(document.getElementById("chatComposer")).display,
+    panel: rect(panel),
+    head: rect(head),
+    toggle: rect(toggle),
+    thread: rect(document.getElementById("threadPane")),
+  });
+}`;
+
 const GEOMETRY = `() => {
   const rect = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top), bottom: Math.round(r.bottom), left: Math.round(r.left), right: Math.round(r.right), height: Math.round(r.height) }; };
   const scroll = document.getElementById("panelScroll");
@@ -250,6 +270,39 @@ test(
       wait(500);
       assertSheetUsable(geometry());
 
+      // An open thread covers the chat, but never the dock: the dock is the only control that
+      // raises the sheet back up, so losing it strands a collapsed sheet closed forever.
+      evaluate('() => { document.getElementById("panel").classList.add("thread-open"); return "ok"; }');
+      wait(300);
+      let t = evaluate(THREAD_GEOMETRY);
+      assert.notEqual(t.chatPaneDisplay, "none", `phone keeps the dock's pane laid out: ${JSON.stringify(t)}`);
+      assert.equal(t.scrollDisplay, "none", "the thread covers the chat list");
+      assert.equal(t.composerDisplay, "none", "the thread covers the chat composer");
+      assert.ok(t.head.height >= 56, `dock stays a touch target with a thread open: ${JSON.stringify(t.head)}`);
+      assert.ok(t.toggle.width > 0 && t.toggle.height > 0, `the toggle is rendered: ${JSON.stringify(t.toggle)}`);
+      assert.ok(
+        t.toggle.top >= t.panel.top && t.toggle.bottom <= t.viewport.height,
+        `the toggle stays on screen: ${JSON.stringify({ toggle: t.toggle, panel: t.panel })}`,
+      );
+      assert.ok(
+        t.thread.top >= t.head.bottom,
+        `the thread starts below the dock instead of covering it: ${JSON.stringify({ thread: t.thread, head: t.head })}`,
+      );
+
+      // Collapsed with the thread still open, the dock is on the bottom edge and reachable.
+      evaluate('() => { document.getElementById("panelHead").click(); return "ok"; }');
+      wait(500);
+      t = evaluate(THREAD_GEOMETRY);
+      assert.equal(t.open, false);
+      assert.equal(t.head.bottom, t.viewport.height, "the dock is on the bottom edge while a thread is open");
+      assert.ok(t.toggle.bottom <= t.viewport.height, `the toggle is tappable: ${JSON.stringify(t.toggle)}`);
+      evaluate('() => { document.getElementById("panelHead").click(); return "ok"; }');
+      wait(500);
+      assert.equal(evaluate(THREAD_GEOMETRY).open, true, "the dock raises the sheet again");
+      evaluate('() => { document.getElementById("panel").classList.remove("thread-open"); return "ok"; }');
+      wait(300);
+      assertSheetUsable(geometry());
+
       // The scrim lowers it again and the artifact is back to full height.
       evaluate('() => { document.getElementById("panelScrim").click(); return "ok"; }');
       wait(500);
@@ -318,6 +371,13 @@ test(
       assert.equal(g.panel.right - g.panel.left, 360, "desktop panel keeps its width");
       assert.equal(g.chat.inert, false);
       assert.equal(g.frame.right, g.panel.left, "artifact and panel sit side by side");
+
+      evaluate('() => { document.getElementById("panel").classList.add("thread-open"); return "ok"; }');
+      wait(300);
+      const desktopThread = evaluate(THREAD_GEOMETRY);
+      assert.equal(desktopThread.chatPaneDisplay, "none", "desktop still drops the whole covered pane");
+      assert.equal(desktopThread.thread.top, desktopThread.panel.top, "desktop's thread owns the full panel");
+      assert.equal(desktopThread.thread.bottom, desktopThread.panel.bottom);
     } finally {
       run(process.execPath, ["bin/lavish-axi.js", "stop", "--port", String(port)], lavishEnv, 15_000);
       run("chrome-devtools-axi", ["stop"], chromeEnv);

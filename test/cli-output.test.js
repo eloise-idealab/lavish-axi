@@ -2999,17 +2999,21 @@ test("streamMessageRecord marks a user-message frame deliverable (MEDIUM regress
   assert.equal(record.id, "msg-1");
 });
 
-test("streamMessageRecord does NOT treat a layout-warning-only frame as a user message (MEDIUM regression)", () => {
-  // A feedback-only batch (no message-tagged prompt) must still be emitted so the agent sees the
-  // warnings, but it is not a delivered user message and must not satisfy/terminate --once.
+test("streamMessageRecord carries a fatal artifact failure and does NOT count it as a user message", () => {
+  // A feedback-only batch (no message-tagged prompt) must still be emitted so the agent learns the
+  // review surface is unusable, but it is not a delivered user message and must neither satisfy
+  // nor terminate --once. `artifact_failures` is the shape takeFeedback actually produces here.
   const { record, isUserMessage } = streamMessageRecord({
     prompts: [],
-    layout_warnings: [{ selector: "html", kind: "page-horizontal-overflow", severity: "error" }],
+    artifact_failures: [{ kind: "artifact-unavailable", detail: "500" }],
   });
   assert.equal(isUserMessage, false);
   assert.equal(record.type, "feedback");
   assert.equal(record.text, "");
-  assert.deepEqual(record.layout_warnings, [{ selector: "html", kind: "page-horizontal-overflow", severity: "error" }]);
+  assert.deepEqual(record.artifact_failures, [{ kind: "artifact-unavailable", detail: "500" }]);
+  // Same key-order contract as the poll response: the failures precede the unbounded snapshot.
+  const keys = Object.keys(record);
+  assert.ok(keys.indexOf("artifact_failures") < keys.indexOf("dom_snapshot"));
 });
 
 test("streamMessageRecord does NOT treat an annotation-only frame as a user message (MEDIUM regression)", () => {

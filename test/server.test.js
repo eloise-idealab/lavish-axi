@@ -581,17 +581,6 @@ test("chrome sandbox does not grant modal prompts", () => {
   assert.doesNotMatch(html, /sandbox="[^"]*allow-modals/);
 });
 
-test("createChromeHtml includes the thread-pane scaffold", () => {
-  const html = createChromeHtml({ key: "k", file: "/tmp/a.html", chat: [] });
-  assert.match(html, /id="chatPane"/);
-  assert.match(html, /id="threadPane"/);
-  assert.match(html, /id="threadBack"/);
-  assert.match(html, /id="backBadge"/);
-  assert.match(html, /id="threadChat"/);
-  assert.match(html, /id="threadInput"/);
-  assert.match(html, /id="threadSend"/);
-});
-
 test("artifact SDK uses a custom annotation card instead of browser prompts", () => {
   const js = createSdkJs("abc");
 
@@ -1110,13 +1099,6 @@ test("chrome bootstraps persisted chat history so missed replies still appear", 
   assert.match(html, /Persisted reply/);
 });
 
-test("chrome client renders persisted chat history", async () => {
-  const js = await chromeClientSource();
-
-  // Tasks 4+5 replaced initialChat.forEach(addChat) with syncChat(initialChat).
-  assert.match(js, /syncChat\(initialChat\)/);
-});
-
 test("chrome can sync persisted chat after the event stream reconnects", async () => {
   const js = await chromeClientSource();
 
@@ -1130,20 +1112,6 @@ test("chrome shows agent working state when a previous poll has released", async
   assert.match(js, /agent-presence/);
   assert.match(js, /Working\.\.\./);
   assert.match(js, /spinner/);
-});
-
-test("chrome disables sending only while ended, never while working (change #2)", async () => {
-  const js = await chromeClientSource();
-
-  assert.match(js, /let agentPresence = "waiting"/);
-  assert.match(js, /function updateSendState\(\)/);
-  // Change #2: the Send button / chat input are gated only by `ended`, not by "working".
-  assert.match(js, /sendButton\.disabled = ended;/);
-  assert.match(js, /sendAndEndButton\.disabled = sendButton\.disabled/);
-  assert.doesNotMatch(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
-  // The sendQueued early-return guard must no longer block on "working" either.
-  assert.doesNotMatch(js, /if \(ended \|\| agentPresence === "working"\) return;/);
-  assert.doesNotMatch(js, /hasContent/);
 });
 
 test("sending with an empty composer nudges instead of blocking", async () => {
@@ -6205,6 +6173,55 @@ test("GET /api/stream pushes each queued user message as its own SSE frame (chan
     assert.ok(texts.includes("second message"));
     // Each delivered message carries a stable id for threading (change #3).
     assert.ok(messages.every((f) => typeof f.data.id === "string" && f.data.id.length > 0));
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// The take that feeds the stream is destructive, so a batch the drain declines to write a frame
+// for is gone from state.json for good. A fatal artifact failure arrives with no prompts at all,
+// which is exactly the batch shape a message-only drain writes nothing for - and it is the one
+// signal saying the review surface the human is meant to use never loaded.
+test("GET /api/stream delivers a fatal artifact failure that arrives with no user message", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-failure-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+    const load = await beginArtifactLoad(base, key);
+
+    const streamRes = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    assert.equal(streamRes.status, 200);
+
+    const recorded = await fetch(`${base}/api/${key}/artifact-failures`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...artifactMutation(load),
+        failures: [{ kind: "artifact-unavailable", detail: "artifact route answered 500" }],
+      }),
+    });
+    assert.equal(recorded.status, 200);
+
+    const frames = await collectSseFrames(streamRes.body, (all) => all.some((f) => f.event === "message"));
+    const failureFrame = frames.find((f) => f.event === "message");
+    assert.ok(failureFrame, "a batch carrying only artifact failures must still get a frame");
+    assert.deepEqual(failureFrame.data.prompts, []);
+    assert.equal(failureFrame.data.artifact_failures.length, 1);
+    assert.equal(failureFrame.data.artifact_failures[0].kind, "artifact-unavailable");
+    assert.equal(failureFrame.data.artifact_failures[0].severity, "fatal");
+
+    // And it really was delivered, not silently left behind: the store no longer holds it.
+    const state = JSON.parse(await readFile(path.join(dir, "state.json"), "utf8"));
+    assert.deepEqual(state.sessions[key].artifact_failures, []);
   } finally {
     controller.abort();
     await server.close();

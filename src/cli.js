@@ -442,8 +442,8 @@ async function streamCommand(args) {
       if (!payload) return;
       const { record, isUserMessage } = streamMessageRecord(payload);
       write(JSON.stringify(record));
-      // Only a real user message counts toward delivery and satisfies --once. Annotation- or
-      // layout-warning-only frames are still emitted (the agent acts on them) but must not
+      // Only a real user message counts toward delivery and satisfies --once. Annotation-only or
+      // artifact-failure-only frames are still emitted (the agent acts on them) but must not
       // terminate a --once harness before an actual user message arrives.
       if (isUserMessage) {
         delivered += 1;
@@ -503,7 +503,7 @@ export function streamMessageRecord(payload) {
     ...(replyTo ? { reply_to: replyTo } : {}),
     text: message?.prompt || "",
     prompts,
-    ...(payload.layout_warnings ? { layout_warnings: payload.layout_warnings } : {}),
+    ...(payload.artifact_failures ? { artifact_failures: payload.artifact_failures } : {}),
     dom_snapshot: payload.dom_snapshot || "",
   };
   return { record, isUserMessage: Boolean(message) };
