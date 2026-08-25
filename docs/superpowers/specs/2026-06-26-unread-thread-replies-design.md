@@ -2,14 +2,14 @@
 
 Date: 2026-06-26
 Branch: `feat/realtime-sse-threading`
-Status: approved (via mockup), pending spec review
+Status: shipped - implemented and merged on branch `merge/main-into-sse`. The Context section below describes the chrome as it was BEFORE this change; for current behavior see README.md, the `lavish-axi` CLI guidance, and AGENTS.md.
 
-## Context
+## Context (state before this change)
 
 The thread panel groups replies under a root and shows a reply-count chip on roots with ≥1 reply ("3 replies · 5m").
-The only unread signal today is the transient **Back badge**, which lights only while you are reading a _different_ thread (`shouldFlagBackBadge` + `setBackBadge`) and clears on `openThread`/`closeThread`.
-In the root list there is no per-thread read/unread state: a chip looks identical whether or not the agent has posted new replies you haven't seen.
-So a reply that lands in a thread you're not currently viewing is easy to miss once you're back in the list.
+Before this change the only unread signal was the transient **Back badge**, which lit only while you were reading a _different_ thread (`shouldFlagBackBadge` + `setBackBadge`) and cleared on `openThread`/`closeThread`.
+In the root list there was no per-thread read/unread state: a chip looked identical whether or not the agent had posted new replies you hadn't seen.
+So a reply that landed in a thread you were not currently viewing was easy to miss once you were back in the list.
 
 ## Goal
 

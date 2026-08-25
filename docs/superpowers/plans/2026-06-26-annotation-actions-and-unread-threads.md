@@ -1,6 +1,8 @@
 # Annotation actions + Unread thread replies — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status: SHIPPED.** This plan was implemented and merged on branch `merge/main-into-sse`; it is kept as a historical record of how the work was scoped, not as outstanding work. The unchecked `- [ ]` boxes below are the original task list as written before implementation - do not re-execute this plan. The current behavior contract lives in README.md (user-facing), the `lavish-axi` CLI guidance strings (agent-facing), and AGENTS.md (architecture invariants).
+
+> **For agentic workers (historical):** this plan was executed with superpowers:subagent-driven-development. Steps used checkbox (`- [ ]`) syntax for tracking while it was in flight.
 
 **Goal:** Two independent lavish-chrome improvements shipped together — (A) make the annotation card's three actions explicit (Cancel / Queue / Send), and (B) mark thread chips that have unread replies (solid brass + dot + "N new").
 

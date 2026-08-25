@@ -889,7 +889,12 @@ export async function serve({
             }
             batch = await store.takeFeedback(key);
           }
-          if (batch.status === "ended") writeFrame("ended", { file });
+          if (batch.status === "ended") {
+            writeFrame("ended", { file });
+            stopped = true;
+            if (!res.writableEnded) res.end();
+            return;
+          }
         } finally {
           draining = false;
           if (drainAgain && !stopped) {

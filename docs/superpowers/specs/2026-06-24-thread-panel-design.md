@@ -2,14 +2,14 @@
 
 Date: 2026-06-24
 Branch: `feat/realtime-sse-threading`
-Status: approved (placement), pending spec review
+Status: shipped - implemented and merged on branch `merge/main-into-sse`. The Context section below describes the chrome as it was BEFORE this change; for current behavior see README.md, the `lavish-axi` CLI guidance, and AGENTS.md.
 
-## Context
+## Context (state before this change)
 
 The lavish chrome is a CSS grid: the artifact `<iframe>` (`.frame`) fills the main area, and the chat lives in a right-hand `.panel` of width `--panel-w` (360px).
-Today the chat is a flat transcript.
-`addChat(role, text, meta)` appends one `.bubble` per message into `chatLog`; a `reply_to` only renders an inline `.reply-quote` snippet above the bubble; every message with an id gets a hover Reply button.
-Reply state lives in `replyToId` plus a `.reply-indicator` strip above the single composer; sending carries `reply_to`.
+Before this change the chat was a flat transcript.
+`addChat(role, text, meta)` appended one `.bubble` per message into `chatLog`; a `reply_to` only rendered an inline `.reply-quote` snippet above the bubble; every message with an id got a hover Reply button.
+Reply state lived in `replyToId` plus a `.reply-indicator` strip above the single composer; sending carried `reply_to`.
 The server stores a flat transcript of `{ role, text, at, id, reply_to? }`, mints ids server-side, validates that any `reply_to` is a real id in the transcript, and broadcasts `agent-reply` and `chat-sync` over SSE.
 
 This design replaces the flat inline-quote rendering with true Slack-style threads: roots stay in the list, replies collapse into a slide-out thread view.

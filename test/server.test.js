@@ -6806,3 +6806,84 @@ test("a chat-sync listener whose state read throws drops the frame and keeps the
     await rm(dir, { force: true, recursive: true });
   }
 });
+
+// The "ended" frame is the stream's terminator, so it has to actually terminate: without setting
+// `stopped` and ending the response, a drain that had another event land mid-flight re-enters from
+// its own `finally`, takes "ended" a second time, and writes a duplicate terminator - and the
+// socket stays open afterwards, holding the stream slot and the presence refcount until the client
+// gives up. Every other terminal branch in this handler (the --once one) already does both.
+test("GET /api/stream ends the response after the ended frame and frees the slot (HIGH regression)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-ended-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    // One slot, so a stream that never released its slot cannot be replaced.
+    maxStreamClients: 1,
+  });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+
+    const streamRes = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    assert.equal(streamRes.status, 200);
+
+    // Queue a message first so the drain that observes the end is one that already wrote frames -
+    // the shape that re-enters through `drainAgain`.
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ prompts: [{ tag: "message", prompt: "last word" }] }),
+    });
+    await fetch(`${base}/api/end`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+
+    // Read to end-of-body rather than to a frame predicate: the property under test is that the
+    // server closes the response itself, so a stream left open fails here instead of passing on a
+    // frame that happened to arrive.
+    const reader = streamRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let terminated = false;
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      const { value, done } = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ value: undefined, done: false }), 300)),
+      ]);
+      if (done) {
+        terminated = true;
+        break;
+      }
+      if (value) buffer += decoder.decode(value, { stream: true });
+    }
+    reader.cancel().catch(() => {});
+    assert.ok(terminated, `the server must end the response after the ended frame\n${buffer}`);
+
+    const endedFrames = buffer.split("\n\n").filter((raw) => raw.includes("event: ended"));
+    assert.equal(endedFrames.length, 1, `exactly one ended terminator\n${buffer}`);
+
+    // The slot and the presence refcount are released with the response, not whenever the client
+    // notices: a second stream fits into the single-slot cap immediately.
+    const second = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    assert.notEqual(second.status, 503, "the ended stream must have released its slot");
+    assert.equal(second.status, 200);
+    second.body.cancel().catch(() => {});
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

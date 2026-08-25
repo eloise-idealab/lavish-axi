@@ -2,13 +2,13 @@
 
 Date: 2026-06-26
 Branch: `feat/realtime-sse-threading`
-Status: approved (layout + label), pending spec review
+Status: shipped - implemented and merged on branch `merge/main-into-sse`. The Context section below describes the chrome as it was BEFORE this change; for current behavior see README.md, the `lavish-axi` CLI guidance, and AGENTS.md.
 
-## Context
+## Context (state before this change)
 
 When you annotate an element in the lavish chrome (Annotate mode on, click a non-native element), the in-iframe SDK (`createArtifactSdk` → `showAnnotationCard` in `src/artifact-sdk.js`) pops a small card in a shadow DOM.
-The card has a heading, a textarea, a hint line, and a two-button row.
-Today that row is **Cancel** and **Queue** (the `.lavish-send` button is labelled "Queue" and only adds the annotation to the pending-prompt pills); the only way to send to the agent immediately is the hidden `⌘/Ctrl+Enter` keyboard shortcut.
+The card has a heading, a textarea, a hint line, and a button row.
+Before this change that row was **Cancel** and **Queue** (the `.lavish-send` button was labelled "Queue" and only added the annotation to the pending-prompt pills); the only way to send to the agent immediately was the hidden `⌘/Ctrl+Enter` keyboard shortcut.
 
 The reviewer asked, while testing, for the three actions to be explicit: when annotating, offer **Cancel**, **Queue**, and **Send**.
 

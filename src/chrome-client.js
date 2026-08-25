@@ -1567,7 +1567,6 @@ function sendThreadReply() {
   // Mark the open thread seen BEFORE renderChat so the chip paints as read.
   markThreadSeen(openThreadRootId);
   renderChat();
-  if (workingBubble) chatLog.appendChild(workingBubble);
   renderThread(openThreadRootId);
   threadInput.value = "";
   clearThreadReplyTarget();

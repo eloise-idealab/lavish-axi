@@ -634,3 +634,55 @@ test("ending the session locks the thread composer, not just the chat composer",
   assert.equal(chrome.element("chatInput").disabled, true);
   assert.equal(chrome.element("send").disabled, true);
 });
+
+// Handed-back drafts are the last thing in the transcript on purpose: they are the only copy of
+// text Lavish can no longer replay, and renderChat's scroll anchor is the last one. A thread reply
+// re-renders the chat, so anything appended after that re-render lands below them and takes the
+// anchor away.
+test("a thread reply leaves the working bubble above the handed-back draft notes", async () => {
+  const chrome = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html" });
+  const sendFrame = (data) => chrome.sendFrameMessage({ artifact_load_token: chrome.artifactLoadToken(), ...data });
+
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root message", at: 1 }] }),
+  });
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "working" }) });
+
+  // Retire a draft: two artifact revisions have to agree the anchor is gone.
+  sendFrame({ type: "lavish:reviewState", state: { card: { selector: "#hero", text: "shorten this" }, fields: [] } });
+  await flushPromises();
+  sendFrame({ type: "lavish:reviewDraftUnrestorable", selector: "#hero" });
+  await flushPromises();
+  chrome.eventSource().listeners.get("reload")();
+  await flushPromises();
+  await flushPromises();
+  chrome.frame.dispatch("load");
+  await flushPromises();
+  sendFrame({ type: "lavish:reviewDraftUnrestorable", selector: "#hero" });
+  await flushPromises();
+
+  const classesOf = (child) => String(child.className || "").split(/\s+/);
+  const indexes = () => {
+    const children = chrome.element("chatLog").children;
+    return {
+      working: children.findIndex((child) => classesOf(child).includes("agent-working")),
+      notes: children.flatMap((child, i) => (classesOf(child).includes("note") ? [i] : [])),
+    };
+  };
+  const before = indexes();
+  assert.notEqual(before.working, -1, "the agent is working, so the working bubble is on screen");
+  assert.equal(before.notes.length, 1, "the unrestorable draft was handed back as a note");
+  assert.ok(before.working < before.notes[0], "the note starts below the working bubble");
+
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "answering in the thread";
+  chrome.element("threadSend").onclick();
+
+  const after = indexes();
+  assert.notEqual(after.working, -1, "the working bubble survives the thread reply's re-render");
+  assert.equal(after.notes.length, 1, "the handed-back note survives it too");
+  assert.ok(
+    after.working < after.notes[0],
+    "the working bubble must not be re-appended past the handed-back draft",
+  );
+});

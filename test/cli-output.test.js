@@ -3577,3 +3577,80 @@ test("boolean flags stop at the -- separator, like the positional resolution alr
   assert.equal(resolveShareRequest(["report.html", "--private"]).generatedPassword, true);
   assert.equal(resolveShareRequest(["report.html", "--", "--private"]).generatedPassword, false);
 });
+
+// `poll` resolves its artifact past every flag it accepts a value for. `--reply-to` is a `stream`
+// feature, but an agent reaching for it on `poll` is a plausible mistake, and before this the
+// unknown flag's VALUE was resolved as the artifact - so the failure named a message id as a path
+// and never mentioned the flag that caused it.
+test("poll resolves the artifact past --reply-to's value instead of treating it as the path", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-poll-args-`);
+  const bin = fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url));
+  // A path that does not exist: canonicalFile fails BEFORE any server is contacted, and the error
+  // names whichever token the command decided was the artifact - which is exactly what we measure.
+  const missing = path.join(stateDir, "poll-fixture.html");
+  const run = (args) =>
+    spawnSync(process.execPath, [bin, "poll", ...args], {
+      cwd: stateDir,
+      encoding: "utf8",
+      env: { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_TELEMETRY: "0" },
+      timeout: 30_000,
+    });
+
+  try {
+    for (const args of [
+      ["--agent-reply", "done", "--reply-to", "msg-7", missing],
+      ["--reply-to", "msg-7", missing],
+      ["--reply-to=msg-7", "--timeout-ms", "50", missing],
+      [missing, "--reply-to", "msg-7"],
+    ]) {
+      const result = run(args);
+      const output = `${result.stdout || ""}${result.stderr || ""}`;
+      assert.notEqual(result.status, 0, `${args.join(" ")} should fail on the missing artifact\n${output}`);
+      assert.match(output, /poll-fixture\.html/, `${args.join(" ")} must resolve the artifact\n${output}`);
+      for (const token of ["msg-7", "--reply-to", "--agent-reply", "done"]) {
+        assert.ok(
+          !output.includes(`'${token}`) && !output.includes(`/${token}`),
+          `${args.join(" ")} must not treat ${token} as the artifact path\n${output}`,
+        );
+      }
+    }
+  } finally {
+    await rm(stateDir, { force: true, recursive: true });
+  }
+});
+
+// `--verbose` is read through the same separator-aware view as `--port`, so both parsers in
+// `server` agree about what `--` means.
+test("server treats --verbose past a -- separator as positional, like every other boolean flag", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-server-args-`);
+  const bin = fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url));
+  const run = (args) =>
+    spawnSync(process.execPath, [bin, "server", "--port", "0", ...args], {
+      cwd: stateDir,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        LAVISH_AXI_STATE_DIR: stateDir,
+        LAVISH_AXI_TELEMETRY: "0",
+        LAVISH_AXI_DEBUG: "",
+        LAVISH_AXI_IDLE_TIMEOUT_MS: "700",
+      },
+      timeout: 30_000,
+    });
+
+  try {
+    // Debug logging is the observable effect of --verbose: the server narrates its startup on
+    // stderr. Both runs exit on the idle timeout, so each one's stderr is complete.
+    const verbose = run(["--verbose"]);
+    assert.notEqual((verbose.stderr || "").trim(), "", `--verbose must enable debug logging\n${verbose.stderr}`);
+
+    const separated = run(["--", "--verbose"]);
+    assert.equal(
+      (separated.stderr || "").trim(),
+      "",
+      `--verbose past -- must not enable debug logging\n${separated.stderr}`,
+    );
+  } finally {
+    await rm(stateDir, { force: true, recursive: true });
+  }
+});
