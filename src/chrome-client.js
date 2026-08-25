@@ -556,6 +556,8 @@ function render() {
 function updateSendState() {
   sendButton.disabled = ended;
   sendAndEndButton.disabled = sendButton.disabled;
+  if (threadInput) threadInput.disabled = ended;
+  if (threadSend) threadSend.disabled = ended;
   if (warningsQueueButton) updateWarningSelectionState();
 }
 
@@ -1099,7 +1101,7 @@ function applySheetState() {
   const docked = mobile && !open;
   panelScroll.inert = ended || docked;
   chatComposer.inert = ended || docked;
-  if (threadPane) threadPane.inert = docked;
+  if (threadPane) threadPane.inert = ended || docked;
   const activeElement = document.activeElement;
   const inHiddenHalf =
     panelScroll.contains(activeElement) ||

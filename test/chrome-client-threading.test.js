@@ -603,3 +603,34 @@ test("setThreadReplyTarget ignores a local id and post uses the open root id", a
   // reply_to must be the open root id, NOT "local-9".
   assert.equal(replyPost.body.prompts[0].reply_to, "root1", "reply_to should be the root id, not the local id");
 });
+
+// An ended session drops a read-only overlay over the panel and disables the chat composer, but
+// the thread composer sits in the same panel behind that overlay. Left enabled it stays in the tab
+// order, accepts a reply nobody will ever receive, and swallows Cmd+Enter with no disabled state
+// and no message - the one failure mode the ended overlay exists to prevent.
+test("ending the session locks the thread composer, not just the chat composer", async () => {
+  const chrome = await createChromeHarness();
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [
+        { id: "root1", role: "agent", text: "Root message", at: 1 },
+        { id: "r1", role: "agent", text: "Threaded reply", reply_to: "root1", at: 2 },
+      ],
+    }),
+  });
+  chrome.threadingOpen("root1");
+  assert.equal(chrome.element("panel").classList.contains("thread-open"), true);
+  assert.equal(Boolean(chrome.element("threadInput").disabled), false);
+  assert.equal(Boolean(chrome.element("threadSend").disabled), false);
+  assert.equal(Boolean(chrome.element("threadPane").inert), false);
+
+  chrome.eventSource().listeners.get("ended")({ data: JSON.stringify({ ended_by: "agent" }) });
+
+  // The thread stays on screen - the user is still reading it - but nothing in it takes input.
+  assert.equal(chrome.element("panel").classList.contains("thread-open"), true);
+  assert.equal(chrome.element("threadInput").disabled, true, "the thread input closes with the chat input");
+  assert.equal(chrome.element("threadSend").disabled, true, "the thread send button closes with Send");
+  assert.equal(chrome.element("threadPane").inert, true, "and the whole pane leaves the tab order");
+  assert.equal(chrome.element("chatInput").disabled, true);
+  assert.equal(chrome.element("send").disabled, true);
+});

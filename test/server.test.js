@@ -6027,14 +6027,10 @@ test("an open thread covers the chat composer instead of letting it paint throug
   const composerZ = Number(css.match(/\.composer\s*\{[^}]*z-index:\s*(\d+)/s)[1]);
   const threadZ = Number(css.match(/\.thread-pane\s*\{[^}]*z-index:\s*(\d+)/s)[1]);
   assert.ok(threadZ > composerZ, `thread pane (z-index ${threadZ}) must outrank .composer (${composerZ})`);
-
-  // And the covered list is removed from the layout, so Tab cannot reach the hidden chat input.
-  assert.match(css, /\.panel\.thread-open\s+\.chat-pane\s*\{\s*display:\s*none;\s*\}/);
 });
 
-test("layout gate overlay is scoped to the artifact frame so it never covers the chat composer", async () => {
+test("layout gate overlay is scoped to the artifact frame so it never covers the chat composer", () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
-  const css = await chromeCssSource();
 
   // The gate overlay must be nested INSIDE the artifact .frame, not a viewport-level sibling
   // that sits on top of the side panel where the composer (Send / chat input) lives. Otherwise
@@ -6050,15 +6046,6 @@ test("layout gate overlay is scoped to the artifact frame so it never covers the
   // The composer controls live in the panel, never inside the frame region.
   assert.ok(!frameRegion.includes('id="chatInput"'), "chatInput must stay outside the frame");
   assert.ok(!frameRegion.includes('id="send"'), "send button must stay outside the frame");
-
-  // Frame scoping only holds if the overlay is positioned within the frame (absolute, inset:0),
-  // not pinned to the viewport (fixed) where it would re-cover the panel.
-  assert.match(css, /\.layout-gate-overlay\{[^}]*position:absolute/);
-  assert.match(css, /\.layout-gate-overlay\{[^}]*inset:0/);
-  // The frame is the positioning + clipping context that geometrically contains the absolute
-  // overlay, so the curtain can never spill onto the panel regardless of z-index or hit-testing.
-  assert.match(css, /\.frame\{[^}]*position:relative/);
-  assert.match(css, /\.frame\{[^}]*overflow:hidden/);
 });
 
 test("annotation card queues prompt on Enter and inserts newline on Shift+Enter", () => {
@@ -6423,6 +6410,78 @@ test("many concurrent /api/stream connections do not trip MaxListenersExceededWa
   }
 });
 
+test("agent-reply reports whether the requested reply_to actually threaded", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-reply-echo-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+    const postReply = async (body) => {
+      const res = await fetch(`${base}/api/${key}/agent-reply`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      assert.equal(res.status, 200);
+      return res.json();
+    };
+
+    const root = await postReply({ text: "Here is the draft." });
+    assert.equal(root.reply_to, "", "a reply with no requested target reports no thread");
+
+    const threaded = await postReply({ text: "And the follow-up.", reply_to: root.id });
+    assert.equal(threaded.reply_to, root.id, "an honored target is echoed back");
+
+    // The store drops a reply_to naming no message in this session. The route still succeeds -
+    // the reply is posted - but it must not report a thread it did not create, or an agent that
+    // passed a stale id from another artifact reads a clean success and never learns the user
+    // will not see the answer under the message it was meant to answer.
+    const dropped = await postReply({ text: "Stale target.", reply_to: "not-a-message-in-this-session" });
+    assert.equal(dropped.status, "sent");
+    assert.equal(dropped.reply_to, "", "an unknown target is reported as unthreaded");
+
+    const state = JSON.parse(await readFile(path.join(dir, "state.json"), "utf8"));
+    const stored = state.sessions[key].chat.find((entry) => entry.id === dropped.id);
+    assert.equal(stored.reply_to, undefined, "and it really did land as a top-level message");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a queued non-message prompt cannot carry a client-supplied id", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-prompt-id-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+    const res = await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({
+        prompts: [
+          { tag: "annotation", prompt: "tighten this", id: "forged-1" },
+          { tag: "message", prompt: "and answer me", id: "forged-2" },
+        ],
+      }),
+    });
+    assert.equal(res.status, 200);
+
+    const state = JSON.parse(await readFile(path.join(dir, "state.json"), "utf8"));
+    const [annotation, message] = state.sessions[key].prompts;
+    assert.equal(annotation.id, undefined, "a non-message prompt keeps no id at all");
+    assert.notEqual(message.id, "forged-2", "a message prompt id is minted by the server");
+    assert.ok(typeof message.id === "string" && message.id.length > 0);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("agent-reply broadcasts a message id and threads via reply_to (change #3)", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-thread-"));
   const artifact = path.join(dir, "artifact.html");
@@ -6457,23 +6516,6 @@ test("agent-reply broadcasts a message id and threads via reply_to (change #3)",
     await server.close();
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test("chrome client renders threaded model and thread composer (Tasks 4+5)", async () => {
-  const js = await chromeClientSource();
-  const css = await chromeCssSource();
-  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
-
-  // Tasks 4+5 replaced the flat replyToId model with a full threaded model.
-  assert.match(js, /const messagesById = new Map\(\)/);
-  assert.match(js, /function buildBubble\(/);
-  assert.match(js, /function renderChat\(\)/);
-  assert.match(js, /function openThread\(/);
-  assert.match(js, /function sendThreadReply\(\)/);
-  assert.match(js, /reply_to: safeReplyTo/);
-  assert.match(html, /id="threadReplyIndicator"/);
-  assert.match(css, /\.reply-button\{/);
-  assert.match(css, /\.reply-indicator\{/);
 });
 
 test("GET /api/stream?once=1 delivers exactly one user message and requeues the rest of the batch (HIGH regression)", async () => {

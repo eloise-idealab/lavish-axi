@@ -14,6 +14,7 @@ process.env.LAVISH_AXI_HOST = "127.0.0.1";
 process.env.LAVISH_AXI_LINK_HOST = "127.0.0.1";
 
 import {
+  agentReplyUnthreadedText,
   collapseHomeDirectory,
   computeCopilotCliHookUpdate,
   createCopilotCliAmbientContextScript,
@@ -51,6 +52,7 @@ import {
   shouldRestartServer,
   startPollWaitReporter,
   stopCommand,
+  streamBusyError,
   streamMessageRecord,
   telemetryCommandName,
   VERSION,
@@ -2985,6 +2987,35 @@ test("stop command reports when no server is running", async () => {
   } finally {
     await rm(dir, { force: true, recursive: true });
   }
+});
+
+test("a refused stream carries the cap reason and the wait the server asked for", () => {
+  const error = streamBusyError("/tmp/artifact.html", "5", "too many concurrent streams (max 16)");
+
+  assert.ok(error instanceof AxiError);
+  assert.equal(error.code, "SERVER_ERROR");
+  assert.match(error.message, /maximum concurrent streams/);
+  const hints = error.suggestions.join("\n");
+  assert.match(hints, /max 16/, "the server's own cap message reaches the agent");
+  assert.match(hints, /Wait 5s/, "Retry-After becomes an actionable wait");
+  assert.match(hints, /never lost/, "and the agent is told waiting costs it nothing");
+  assert.match(hints, /lavish-axi poll \/tmp\/artifact\.html/, "with a working fallback for this artifact");
+});
+
+test("a refused stream still says how long to wait when the server sent no usable Retry-After", () => {
+  for (const header of [null, "", "not-a-number", "0"]) {
+    const hints = streamBusyError("/tmp/a.html", header, "").suggestions;
+    assert.match(hints.join("\n"), /Wait 5s/, `header ${JSON.stringify(header)} falls back to the documented 5s`);
+    assert.equal(hints.length, 2, "an absent cap message leaves no empty hint behind");
+  }
+});
+
+test("a dropped --reply-to is reported as an unthreaded post, not a failure", () => {
+  const text = agentReplyUnthreadedText("stale-id-7");
+
+  assert.match(text, /stale-id-7/, "the id the agent passed is named");
+  assert.match(text, /top-level message/, "and what actually happened to the reply");
+  assert.doesNotMatch(text, /fail|error/i, "the reply was posted, so it must not read as a failure");
 });
 
 test("streamMessageRecord marks a user-message frame deliverable (MEDIUM regression)", () => {

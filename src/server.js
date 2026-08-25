@@ -1090,7 +1090,7 @@ export async function serve({
       // answers. Human sends remain available while working because the server queues them for the
       // next poll. See "SSE agent-presence returns to waiting after an agent reply".
       clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      res.json({ status: "sent", id: result.message.id });
+      res.json({ status: "sent", id: result.message.id, reply_to: result.message.reply_to || "" });
     } catch (error) {
       next(error);
     }

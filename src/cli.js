@@ -393,10 +393,13 @@ async function streamCommand(args) {
   const agentReply = flagValue(args, "--agent-reply");
   if (agentReply) {
     const replyTo = flagValue(args, "--reply-to");
-    await postJson(`${baseUrl}/api/${sessionKey(absolute)}/agent-reply`, {
+    const posted = await postJson(`${baseUrl}/api/${sessionKey(absolute)}/agent-reply`, {
       text: agentReply,
       ...(replyTo ? { reply_to: replyTo } : {}),
     });
+    if (replyTo && posted?.reply_to !== replyTo) {
+      process.stderr.write(`${agentReplyUnthreadedText(replyTo)}\n`);
+    }
   }
   const once = args.includes("--once");
   const write = (line) => process.stdout.write(`${line}\n`);
@@ -414,6 +417,9 @@ async function streamCommand(args) {
     throw new AxiError("No active Lavish Editor session for this file", "NOT_FOUND", [
       `Run \`lavish-axi ${absolute}\` first`,
     ]);
+  }
+  if (response.status === 503) {
+    throw streamBusyError(absolute, response.headers.get("retry-after"), await responseErrorMessage(response));
   }
   if (!response.ok || !response.body) {
     throw new AxiError(`Lavish Editor stream failed: ${response.status}`, "SERVER_ERROR");
@@ -527,6 +533,28 @@ export function drainSseBuffer(buffer, onFrame) {
     if (dataLines.length > 0) onFrame(event, dataLines.join("\n"));
   }
   return buffer;
+}
+
+async function responseErrorMessage(response) {
+  try {
+    const body = await response.json();
+    return String(body?.error || "");
+  } catch {
+    return "";
+  }
+}
+
+export function streamBusyError(file, retryAfter, detail) {
+  const seconds = Number(retryAfter) > 0 ? Number(retryAfter) : 5;
+  return new AxiError("Lavish Editor is already serving its maximum concurrent streams", "SERVER_ERROR", [
+    ...(detail ? [detail] : []),
+    `Wait ${seconds}s and re-run the same \`lavish-axi stream\` command - queued messages are never lost while you wait`,
+    `Or run \`lavish-axi poll ${file}\` to drain one batch instead`,
+  ]);
+}
+
+export function agentReplyUnthreadedText(replyTo) {
+  return `Lavish Editor: --reply-to ${replyTo} matched no message in this session, so the reply was posted as a new top-level message. Use an id from this artifact's own stream records.`;
 }
 
 export function streamBannerText(file) {

@@ -163,8 +163,9 @@ export class SessionStore {
     }
     const normalized = prompts.map(normalizePrompt);
     const normalizedPrompts = normalized.map((entry) => entry.prompt);
-    // Message ids and reply targets are server-owned: mint the id here so the unauthenticated
-    // local API cannot forge or duplicate one, and drop a reply_to that does not point at a
+    // Message ids and reply targets are server-owned: mint the id for every message prompt and
+    // strip a client-supplied one from every other prompt, so the unauthenticated local API can
+    // neither forge nor duplicate one, and drop a reply_to that does not point at a
     // message already in this session's transcript so a thread cannot be spoofed. A restore is
     // exempt - it replays an already-accepted batch verbatim and must keep the ids minted the
     // first time, or the chrome's optimistic bubbles reconcile against ids that changed.
@@ -172,6 +173,7 @@ export class SessionStore {
       const knownMessageIds = new Set((session.chat || []).map((entry) => entry.id).filter(Boolean));
       for (const prompt of normalizedPrompts) {
         if (prompt.tag === "message" && prompt.prompt) prompt.id = newMessageId();
+        else delete prompt.id;
         if (prompt.reply_to && !knownMessageIds.has(prompt.reply_to)) delete prompt.reply_to;
       }
     }
@@ -734,8 +736,9 @@ function normalizePrompt(prompt) {
     tag: String(prompt.tag || ""),
     text: String(prompt.text || ""),
   };
-  // Carried through so a restore replays a server-minted id and its thread verbatim. On a
-  // fresh queue queuePrompts overwrites `id` unconditionally, so a client cannot forge one.
+  // Carried through so a restore replays a server-minted id and its thread verbatim. On a fresh
+  // queue queuePrompts mints `id` for every message prompt and strips it from every other prompt,
+  // so a client cannot forge one.
   if (prompt.id) normalized.id = String(prompt.id);
   if (prompt.reply_to) normalized.reply_to = String(prompt.reply_to);
   const target = normalizeTarget(prompt.target);
