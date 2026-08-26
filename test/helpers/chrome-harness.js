@@ -150,7 +150,17 @@ export async function createChromeHarness({
       type: "",
       className: "",
       value: "",
-      innerHTML: "",
+      // Assigning "" is how the client empties a container it then re-appends into, and a real DOM
+      // drops the existing children with it. Modelling that is load-bearing: without it a stale
+      // child survives every repaint here, so a pane that failed to repaint would still look right.
+      _innerHTML: "",
+      get innerHTML() {
+        return this._innerHTML;
+      },
+      set innerHTML(value) {
+        this._innerHTML = value;
+        if (value === "") this.children.length = 0;
+      },
       textContent: "",
       scrollTop: 0,
       scrollHeight: 0,

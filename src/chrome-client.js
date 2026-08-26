@@ -208,6 +208,12 @@ const threadReplyIndicatorClear = /** @type {HTMLButtonElement} */ (
 );
 let threadReplyToId = "";
 let localMessageSeq = 0;
+// Which optimistic (`local-`) bubble stands in for which still-unaccepted queued prompt. Keyed by
+// the prompt object so nothing has to be persisted or cleaned up: a prompt the server accepted is
+// spliced out of `queued` and the entry goes with it, and a queue restored from sessionStorage is a
+// fresh set of objects with no stand-ins on screen to match.
+/** @type {WeakMap<object, string>} */
+const optimisticMessageIds = new WeakMap();
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
 const layoutGateMaxHoldMs =
@@ -717,6 +723,38 @@ function rememberMessage(message) {
     messagesById.set(id, message);
   } else {
     messageOrder.push(message);
+  }
+}
+
+// Remove one message from the in-memory model. Only optimistic local sends are ever forgotten this
+// way; server-owned messages leave through a full setMessages() rebuild instead.
+function forgetMessage(id) {
+  const messageId = String(id);
+  if (!messagesById.delete(messageId)) return false;
+  const index = messageOrder.indexOf(messageId);
+  if (index !== -1) messageOrder.splice(index, 1);
+  return true;
+}
+
+// An optimistic bubble stands in for a prompt the server has not accepted yet: a successful POST is
+// what makes the server mint the durable message and broadcast it over chat-sync, which replaces
+// the stand-in. A batch the server refused (an ended session, an atomic 400 reject) or a request
+// that never landed produces no such message, so the stand-in has to go - otherwise the transcript
+// shows the user a message that was never persisted or delivered. The prompts themselves stay
+// queued as pills, which is the surface that still lets the user retry or remove them.
+function dropOptimisticMessages(prompts) {
+  let removed = false;
+  for (const prompt of prompts) {
+    const id = optimisticMessageIds.get(prompt);
+    if (!id) continue;
+    optimisticMessageIds.delete(prompt);
+    if (forgetMessage(id)) removed = true;
+  }
+  if (!removed) return;
+  renderChat();
+  if (openThreadRootId) {
+    if (messagesById.has(openThreadRootId)) renderThread(openThreadRootId);
+    else closeThread();
   }
 }
 
@@ -1518,8 +1556,10 @@ function sendQueued(endAfter) {
       if (attachments.length) prompt.attachments = attachments;
       queued.push(prompt);
       persistQueuedPrompts();
+      const localId = "local-" + ++localMessageSeq;
+      optimisticMessageIds.set(prompt, localId);
       rememberMessage({
-        id: "local-" + ++localMessageSeq,
+        id: localId,
         role: "user",
         text: text || "Image message",
         at: Date.now(),
@@ -1563,6 +1603,7 @@ function sendThreadReply() {
   persistQueuedPrompts();
   const localMsg = { id: "local-" + ++localMessageSeq, role: "user", text, at: Date.now() };
   if (safeReplyTo) localMsg.reply_to = safeReplyTo;
+  optimisticMessageIds.set(message, localMsg.id);
   rememberMessage(localMsg);
   // Mark the open thread seen BEFORE renderChat so the chip paints as read.
   markThreadSeen(openThreadRootId);
@@ -1581,7 +1622,11 @@ async function submitQueued() {
   }
 
   let succeeded = false;
-  submitQueuedPromise = submitQueuedOnce();
+  // Snapshot the batch here rather than inside submitQueuedOnce so the failure handling below knows
+  // exactly which prompts went unaccepted. Both places run synchronously before the first await, so
+  // this is the same batch the POST carries.
+  const batch = queued.slice();
+  submitQueuedPromise = submitQueuedOnce(batch);
   try {
     const result = await submitQueuedPromise;
     succeeded = result !== false;
@@ -1592,6 +1637,10 @@ async function submitQueued() {
     submitQueuedAgain = false;
     if (!succeeded) {
       endAfterSubmit = false;
+      // Nothing was delivered and nothing retries on its own (shouldSubmitAgain is dropped here
+      // too), so every optimistic bubble in this batch is standing in for a message the server does
+      // not have.
+      dropOptimisticMessages(batch);
     } else if (!ended && shouldSubmitAgain) {
       if (queued.length) {
         submitQueued().catch(() => {});
@@ -1603,8 +1652,7 @@ async function submitQueued() {
   }
 }
 
-async function submitQueuedOnce() {
-  const prompts = queued.slice();
+async function submitQueuedOnce(prompts) {
   const shouldEndSession = endAfterSubmit;
   const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: pendingSnapshot };
   if (shouldEndSession) body.endSession = true;

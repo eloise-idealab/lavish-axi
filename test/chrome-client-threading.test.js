@@ -683,3 +683,120 @@ test("a thread reply leaves the working bubble above the handed-back draft notes
   assert.equal(after.notes.length, 1, "the handed-back note survives it too");
   assert.ok(after.working < after.notes[0], "the working bubble must not be re-appended past the handed-back draft");
 });
+
+// An optimistic bubble is a stand-in for a prompt the server has not accepted yet: the POST is what
+// makes the server mint the durable message and broadcast it over chat-sync. When the POST is
+// refused or never lands, no such message will ever exist, so a stand-in left on screen tells the
+// user their message was delivered while nothing was persisted or queued for the agent.
+function refusingChrome(respond) {
+  return createChromeHarness({
+    fetchImpl: async (url, init) => {
+      if (String(url).includes("/prompts")) return respond(init);
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+}
+
+async function sendComposerMessage(chrome, text) {
+  chrome.element("chatInput").value = text;
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+}
+
+test("a send the server refuses (400) removes its optimistic bubble but keeps the prompt queued", async () => {
+  const chrome = await refusingChrome(async () => ({ ok: false, status: 400, json: async () => ({}) }));
+  await sendComposerMessage(chrome, "never persisted");
+
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "never persisted"),
+    false,
+    "a refused batch must not leave a message the server never persisted",
+  );
+  assert.equal(chrome.chatLogHtml().includes("never persisted"), false, "and it must be off screen too");
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["never persisted"],
+    "the prompt itself stays queued as a pill, which is what lets the user retry it",
+  );
+});
+
+test("a send whose request never lands removes its optimistic bubble", async () => {
+  const chrome = await refusingChrome(async () => {
+    throw new Error("network down");
+  });
+  await sendComposerMessage(chrome, "lost in flight");
+
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "lost in flight"),
+    false,
+    "a request that never landed delivered nothing",
+  );
+  assert.equal(chrome.chatLogHtml().includes("lost in flight"), false);
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["lost in flight"],
+  );
+});
+
+test("a send refused because the session already ended removes its optimistic bubble", async () => {
+  const chrome = await refusingChrome(async () => ({
+    ok: false,
+    status: 409,
+    json: async () => ({ status: "ended" }),
+  }));
+  await sendComposerMessage(chrome, "too late");
+
+  assert.equal(chrome.element("send").disabled, true, "the 409 put this chrome into the ended state");
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "too late"),
+    false,
+    "no later poll will deliver this batch, so its bubble is a phantom",
+  );
+  assert.equal(chrome.chatLogHtml().includes("too late"), false);
+});
+
+test("a send the server accepts keeps its optimistic bubble until chat-sync replaces it", async () => {
+  const chrome = await refusingChrome(async () => ({ ok: true, json: async () => ({}) }));
+  await sendComposerMessage(chrome, "landed");
+
+  assert.ok(
+    chrome.threadingOrdered().some((m) => m.text === "landed"),
+    "an accepted batch is persisted, so the stand-in stays until the server's own message arrives",
+  );
+  assert.equal(chrome.queued().length, 0);
+
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "server1", role: "user", text: "landed", at: 1 }] }),
+  });
+  assert.deepEqual(
+    chrome.threadingOrdered().map((m) => m.id),
+    ["server1"],
+    "chat-sync replaces the stand-in with the server-owned message",
+  );
+});
+
+test("a refused thread reply removes its optimistic bubble from the open thread", async () => {
+  const chrome = await refusingChrome(async () => ({ ok: false, status: 400, json: async () => ({}) }));
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root message", at: 1 }] }),
+  });
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "reply that never lands";
+  chrome.element("threadSend").onclick();
+  assert.ok(chrome.threadingOrdered().some((m) => m.text === "reply that never lands"));
+
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "reply that never lands"),
+    false,
+  );
+  const threadHtml = chrome
+    .element("threadChat")
+    .children.map((child) => child.innerHTML || "")
+    .join("");
+  assert.equal(threadHtml.includes("reply that never lands"), false, "the open thread repaints without it");
+  assert.equal(threadHtml.includes("Root message"), true, "the durable root is untouched");
+});
