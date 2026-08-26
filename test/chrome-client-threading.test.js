@@ -681,8 +681,5 @@ test("a thread reply leaves the working bubble above the handed-back draft notes
   const after = indexes();
   assert.notEqual(after.working, -1, "the working bubble survives the thread reply's re-render");
   assert.equal(after.notes.length, 1, "the handed-back note survives it too");
-  assert.ok(
-    after.working < after.notes[0],
-    "the working bubble must not be re-appended past the handed-back draft",
-  );
+  assert.ok(after.working < after.notes[0], "the working bubble must not be re-appended past the handed-back draft");
 });
