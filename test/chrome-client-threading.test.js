@@ -800,3 +800,49 @@ test("a refused thread reply removes its optimistic bubble from the open thread"
   assert.equal(threadHtml.includes("reply that never lands"), false, "the open thread repaints without it");
   assert.equal(threadHtml.includes("Root message"), true, "the durable root is untouched");
 });
+
+// A second message can be composed while the first batch's POST is still in flight. That later
+// send finds submitQueued already running, so it only raises the "submit again" flag - it never
+// gets a POST of its own. When the in-flight batch then fails, that flag is dropped along with it,
+// so nothing retries and no chat-sync will ever name the later message either: its stand-in is
+// just as phantom as the failed batch's, even though it was never part of that batch.
+test("a failed send removes the optimistic bubble of a message queued while it was in flight", async () => {
+  /** @type {() => void} */
+  let releaseFirstPost = () => {};
+  let promptPosts = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).includes("/prompts")) return { ok: true, json: async () => ({}) };
+      promptPosts += 1;
+      if (promptPosts > 1) return { ok: true, json: async () => ({}) };
+      return new Promise((resolve) => {
+        releaseFirstPost = () => resolve({ ok: false, status: 400, json: async () => ({}) });
+      });
+    },
+  });
+
+  await sendComposerMessage(chrome, "in flight");
+  assert.equal(promptPosts, 1, "the first send's POST is still pending");
+  await sendComposerMessage(chrome, "queued mid-flight");
+  assert.equal(promptPosts, 1, "the second send rode the in-flight submit rather than posting");
+
+  releaseFirstPost();
+  await flushPromises();
+
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "in flight"),
+    false,
+    "the failed batch's stand-in goes, as always",
+  );
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "queued mid-flight"),
+    false,
+    "and so does the later message's, which the failure left unsubmitted with nothing to retry it",
+  );
+  assert.equal(chrome.chatLogHtml().includes("queued mid-flight"), false, "off screen too");
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["in flight", "queued mid-flight"],
+    "both prompts stay queued as pills, which is the surface that still lets the user retry them",
+  );
+});

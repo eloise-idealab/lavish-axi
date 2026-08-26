@@ -1622,9 +1622,9 @@ async function submitQueued() {
   }
 
   let succeeded = false;
-  // Snapshot the batch here rather than inside submitQueuedOnce so the failure handling below knows
-  // exactly which prompts went unaccepted. Both places run synchronously before the first await, so
-  // this is the same batch the POST carries.
+  // Snapshot the batch here rather than inside submitQueuedOnce so the POST carries exactly the
+  // prompts that were queued when it started, even though this runs synchronously before the first
+  // await; a later send appends to `queued` without joining this request.
   const batch = queued.slice();
   submitQueuedPromise = submitQueuedOnce(batch);
   try {
@@ -1638,9 +1638,11 @@ async function submitQueued() {
     if (!succeeded) {
       endAfterSubmit = false;
       // Nothing was delivered and nothing retries on its own (shouldSubmitAgain is dropped here
-      // too), so every optimistic bubble in this batch is standing in for a message the server does
-      // not have.
-      dropOptimisticMessages(batch);
+      // too). That covers more than this batch: a send composed while the POST was in flight only
+      // set that flag, so it never got a request of its own either. `queued` is exactly the
+      // unaccepted set - a batch is spliced out of it only on success - so every stand-in still
+      // keyed to a prompt in it is standing in for a message the server does not have.
+      dropOptimisticMessages(queued);
     } else if (!ended && shouldSubmitAgain) {
       if (queued.length) {
         submitQueued().catch(() => {});
