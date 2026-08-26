@@ -2587,11 +2587,12 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
         }
         if (status === "superseded") {
           setHandoffSuperseded(true);
-          // The takeover banner sits in the conversation panel, which the layout gate overlay
-          // covers whenever the gate is enabled. A chrome that never loaded the artifact would
-          // otherwise show the checking spinner until the gate's max hold expires and then
-          // reveal an empty frame, with the only recovery control hidden the whole time. Say it
-          // on the overlay instead. Still no background retry: the reload is the user's to make.
+          // The takeover banner sits in the conversation panel: the gate curtain is scoped to the
+          // artifact frame and no longer covers it, but it is away from the artifact area the user
+          // is watching and entirely off-screen behind a phone's collapsed sheet. A chrome that
+          // never loaded the artifact would otherwise show the checking spinner until the gate's
+          // max hold expires and then reveal an empty frame that explains nothing. Say it on the
+          // overlay too. Still no background retry: the reload is the user's to make.
           if (!artifactLoadToken) {
             setLayoutGateFailure(
               "This review is already open in another tab.",
