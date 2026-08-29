@@ -2364,8 +2364,14 @@ function setPollActive(key, activePolls, deliveredFeedback, events, active) {
     activePolls.delete(key);
   } else {
     activePolls.set(key, nextCount);
-    deliveredFeedback.delete(key);
   }
+  // A poll that attaches with nothing else in flight is the agent starting a new round, and that
+  // is the ONLY transition here allowed to retire the previous round's delivery. Releasing a poll
+  // never is: with two polls open, the second one's cleanup would erase the marker the first one
+  // just set and report an agent that is working as merely waiting. Neither is a poll attaching
+  // beside an existing one, which is the same erasure of a sibling's delivery from the other side.
+  // Everything else that retires delivery is an explicit conclusion, through clearFeedbackDelivery.
+  if (active && count === 0) deliveredFeedback.delete(key);
   const nextPresence = computePresence(key, activePolls, deliveredFeedback);
   if (nextPresence !== previousPresence) events.emit("agent-presence", key, nextPresence);
 }

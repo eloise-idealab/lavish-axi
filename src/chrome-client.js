@@ -1700,7 +1700,6 @@ async function submitQueuedOnce(prompts) {
     markSessionEnded();
     return;
   }
-  if (agentPresence === "listening") setAgentPresence("working");
 }
 
 function normalizeLayoutFindings(value) {

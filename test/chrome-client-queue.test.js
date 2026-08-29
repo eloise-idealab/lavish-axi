@@ -3515,6 +3515,43 @@ test("chrome client sends queued prompts while the agent is working", async () =
   assert.equal(chrome.queued().length, 0);
 });
 
+test("a send acknowledgement does not finish the round before late feedback delivery", async () => {
+  /** @type {(value?: any) => void} */
+  let acknowledge = () => {};
+  const acknowledgement = new Promise((resolve) => {
+    acknowledge = resolve;
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (url === "/api/abc/prompts") return acknowledgement;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  const workingBubbles = () =>
+    chrome.element("chatLog").children.filter((child) => String(child.className).includes("agent-working"));
+
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Late feedback matters", selector: "h1", tag: "message", text: "Late feedback matters" },
+  });
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  // The transport has not acknowledged the send yet, so there is no round completion to observe.
+  assert.equal(workingBubbles().length, 0);
+  acknowledge({ ok: true });
+  await flushPromises();
+  await flushPromises();
+
+  // A 200 from /prompts is only an acknowledgement. The poll's later delivery event is the
+  // terminal signal that moves the chrome into the agent-working state.
+  assert.equal(workingBubbles().length, 0);
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "working" }) });
+  assert.equal(workingBubbles().length, 1);
+});
+
 test("send controls stay enabled while the agent works and lock only once the session ends", async () => {
   const chrome = await createChromeHarness({
     fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
