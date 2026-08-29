@@ -993,3 +993,88 @@ test("taking back a queued thread reply retracts its stand-in and the seen credi
   assert.match(html, /thread-chip unread/);
   assert.match(html, /1 new/);
 });
+
+// A prompt the POST is already carrying is not one the user took back from the server's view: that
+// request may still be accepted, and its chat-sync is what reconciles the stand-in. Retracting the
+// stand-in on the pill click alone refunds a seen credit for a message that then really arrives,
+// so the user's own reply comes back marked unread.
+test("removing a pill whose POST is in flight leaves the stand-in for the chat-sync to reconcile", async () => {
+  /** @type {(ok: boolean) => void} */
+  let releasePost = () => {};
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).includes("/prompts")) return { ok: true, json: async () => ({}) };
+      return new Promise((resolve) => {
+        releasePost = (ok) => resolve({ ok, status: ok ? 200 : 400, json: async () => ({}) });
+      });
+    },
+  });
+  const syncChat = (chat) => chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat }) });
+  const root = { id: "root1", role: "agent", text: "Root message", at: 1 };
+  syncChat([root]);
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "already on the wire";
+  chrome.element("threadSend").onclick();
+  chrome.element("threadBack").dispatch("click", {});
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  chrome.removeQueuedPrompt(0);
+
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "already on the wire"),
+    true,
+    "the stand-in stays while the request that carries it is unanswered",
+  );
+
+  releasePost(true);
+  await flushPromises();
+  syncChat([root, { id: "r1", role: "user", text: "already on the wire", reply_to: "root1", at: 2 }]);
+
+  assert.deepEqual(
+    chrome.threadingOrdered().filter((m) => m.text === "already on the wire").length,
+    1,
+    "the accepted message replaces its stand-in rather than doubling it",
+  );
+  assert.equal(chrome.threadingUnread("root1"), 0, "the user's own delivered reply is not unread");
+  assert.doesNotMatch(chrome.chatLogHtml(), /thread-chip unread/);
+});
+
+// The other half of that guard: nothing else settles a prompt the user removed mid-flight, so the
+// submit's failure path has to drop what its own batch was carrying as well as what is still
+// queued. A prompt in both is dropped once - the second pass finds no stand-in left to consume.
+test("a pill removed mid-flight is retracted when that POST is refused, without over-refunding", async () => {
+  /** @type {() => void} */
+  let refusePost = () => {};
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).includes("/prompts")) return { ok: true, json: async () => ({}) };
+      return new Promise((resolve) => {
+        refusePost = () => resolve({ ok: false, status: 400, json: async () => ({}) });
+      });
+    },
+  });
+  const syncChat = (chat) => chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat }) });
+  const root = { id: "root1", role: "agent", text: "Root message", at: 1 };
+  const seenReply = { id: "r1", role: "agent", text: "an answer you read", reply_to: "root1", at: 2 };
+  syncChat([root, seenReply]);
+  chrome.threadingOpen("root1");
+  assert.equal(chrome.threadingUnread("root1"), 0, "opening the thread reads the agent's reply");
+  chrome.element("threadInput").value = "taken back mid-flight";
+  chrome.element("threadSend").onclick();
+  chrome.element("threadBack").dispatch("click", {});
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  chrome.removeQueuedPrompt(0);
+  refusePost();
+  await flushPromises();
+
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "taken back mid-flight"),
+    false,
+    "the refused stand-in is retracted even though the pill left the queue first",
+  );
+  assert.equal(chrome.threadingUnread("root1"), 0, "the reply the user already read stays read");
+  assert.doesNotMatch(chrome.chatLogHtml(), /thread-chip unread/);
+});

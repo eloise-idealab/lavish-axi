@@ -4901,3 +4901,48 @@ test("crossing the breakpoint in either direction leaves no sheet state behind",
   assert.equal(chrome.focusLog.at(-1), "panelToggle");
   assert.equal(chrome.storage.has("lavish-axi:sheet-open:abc"), false);
 });
+
+// The chrome renders an optimistic bubble for an image-only send and the server writes the entry
+// that chat-sync replaces it with; a label only one of them knows makes the message change wording
+// under the user the moment the sync lands. Both surfaces are executed here rather than read.
+test("the optimistic bubble for an image-only send reads what the server records for it", async () => {
+  const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+  const { SessionStore } = await import("../src/session-store.js");
+
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, attachmentMaxBytes: 1024, attachmentMaxCount: 4 },
+    fetchImpl: async () => ({ ok: true, json: async () => ({ attachment: { id: "8".repeat(64) + ".png" } }) }),
+  });
+  chrome.element("chatInput").dispatch("paste", clipboardEvent(pastedImage("only.png")));
+  await flushPromises();
+  await flushPromises();
+  chrome.element("send").click();
+  const bubble = chrome.threadingOrdered().find((m) => m.role === "user");
+
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-agree-"));
+  try {
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const store = new SessionStore(path.join(dir, "state.json"));
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const known = "8".repeat(64) + ".png";
+    await store.queuePrompts(
+      session.key,
+      { prompts: [{ tag: "message", prompt: "", attachments: [{ id: known, name: "only.png" }] }] },
+      {
+        resolveAttachment: async (_key, id) =>
+          id === known ? { id: known, type: "image", path: "/vetted.png", mime: "image/png", bytes: 12 } : null,
+        maxPerPrompt: 4,
+        maxPromptBytes: 25 * 1024 * 1024,
+      },
+    );
+    const stored = await store.findByKey(session.key);
+    const entry = stored.chat.find((m) => m.role === "user");
+    assert.ok(entry, "the server records the image-only send");
+    assert.equal(bubble.text, entry.text);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

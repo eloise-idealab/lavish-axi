@@ -163,20 +163,6 @@ export class SessionStore {
     }
     const normalized = prompts.map(normalizePrompt);
     const normalizedPrompts = normalized.map((entry) => entry.prompt);
-    // Message ids and reply targets are server-owned: mint the id for every message prompt and
-    // strip a client-supplied one from every other prompt, so the unauthenticated local API can
-    // neither forge nor duplicate one, and drop a reply_to that does not point at a
-    // message already in this session's transcript so a thread cannot be spoofed. A restore is
-    // exempt - it replays an already-accepted batch verbatim and must keep the ids minted the
-    // first time, or the chrome's optimistic bubbles reconcile against ids that changed.
-    if (!restoring) {
-      const knownMessageIds = new Set((session.chat || []).map((entry) => entry.id).filter(Boolean));
-      for (const prompt of normalizedPrompts) {
-        if (prompt.tag === "message" && prompt.prompt) prompt.id = newMessageId();
-        else delete prompt.id;
-        if (prompt.reply_to && !knownMessageIds.has(prompt.reply_to)) delete prompt.reply_to;
-      }
-    }
     // Resolve every attachment BEFORE mutating anything. If any prompt's images
     // can't be fully honored - malformed, an unknown id, or over the per-prompt
     // count/byte cap - reject the WHOLE batch and persist nothing (C4). Silently
@@ -199,6 +185,24 @@ export class SessionStore {
           maxPromptBytes: Number.isFinite(options.maxPromptBytes) ? options.maxPromptBytes : null,
         },
       };
+    }
+
+    // Message ids and reply targets are server-owned: mint the id for every message prompt and
+    // strip a client-supplied one from every other prompt, so the unauthenticated local API can
+    // neither forge nor duplicate one, and drop a reply_to that does not point at a
+    // message already in this session's transcript so a thread cannot be spoofed. A restore is
+    // exempt - it replays an already-accepted batch verbatim and must keep the ids minted the
+    // first time, or the chrome's optimistic bubbles reconcile against ids that changed.
+    // This runs AFTER attachment resolution so `isTranscriptMessage` reads the same prompt here
+    // as the transcript entry below does: resolution is the only step that rewrites the fields it
+    // reads, and an id with no chat entry - or a chat entry with no id - is worse than either.
+    if (!restoring) {
+      const knownMessageIds = new Set((session.chat || []).map((entry) => entry.id).filter(Boolean));
+      for (const prompt of normalizedPrompts) {
+        if (isTranscriptMessage(prompt)) prompt.id = newMessageId();
+        else delete prompt.id;
+        if (prompt.reply_to && !knownMessageIds.has(prompt.reply_to)) delete prompt.reply_to;
+      }
     }
 
     const revision = normalizeRevision(session.artifact_revision);
@@ -250,10 +254,10 @@ export class SessionStore {
     const userMessages = restoring
       ? []
       : acceptedPrompts
-          .filter((prompt) => prompt.tag === "message" && prompt.prompt)
+          .filter((prompt) => isTranscriptMessage(prompt))
           .map((prompt) => ({
             role: "user",
-            text: prompt.prompt,
+            text: prompt.prompt || IMAGE_ONLY_MESSAGE_TEXT,
             at: new Date().toISOString(),
             ...(prompt.id ? { id: prompt.id } : {}),
             ...(prompt.reply_to ? { reply_to: prompt.reply_to } : {}),
@@ -728,6 +732,19 @@ export function sessionKey(file) {
 // Returns `{ prompt, malformed }`: `malformed` is non-empty when the payload's
 // `attachments` field exists but cannot be honored as written, which fails the
 // whole batch rather than being normalized away (C4, see queuePrompts).
+// The transcript label for a message the user sent as images alone. The chrome renders the same
+// string on that send's optimistic bubble (src/chrome-client.js, sendQueued's
+// `text: text || "Image message"`), so the two surfaces change together.
+const IMAGE_ONLY_MESSAGE_TEXT = "Image message";
+
+// A message prompt earns a transcript entry, and the server-minted id that goes with it, when it
+// carries something the user can see afterwards: typed text, or images alone. Both queuePrompts
+// sites read this one predicate so an id and its chat entry can never be minted apart.
+function isTranscriptMessage(prompt) {
+  if (prompt.tag !== "message") return false;
+  return Boolean(prompt.prompt || (Array.isArray(prompt.attachments) && prompt.attachments.length > 0));
+}
+
 function normalizePrompt(prompt) {
   const normalized = {
     uid: String(prompt.uid || ""),

@@ -245,6 +245,7 @@ const snapshotRequests = [];
 let endAfterSubmit = false;
 let workingBubble = null;
 let submitQueuedPromise = null;
+let submitQueuedBatch = null;
 let submitQueuedAgain = false;
 let lastScroll = { x: 0, y: 0 };
 // In-iframe review context (an open annotation card's unsent text, Lavish-owned question
@@ -1335,9 +1336,14 @@ function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
   const [removed] = queued.splice(index, 1);
   persistQueuedPrompts();
-  // A prompt is spliced out of `queued` on success alone, so one removed by hand was never
-  // accepted: its stand-in has to go the same way a refused batch's does, credit included.
-  if (removed) dropOptimisticMessages([removed]);
+  // Taking a prompt back before any request carried it means the server never heard of it, so its
+  // stand-in goes the way a refused batch's does, credit included. A prompt the in-flight POST is
+  // still carrying is not that: that request may yet be accepted, and the chat-sync it returns is
+  // what reconciles the stand-in. Its outcome is settled where every other outcome is - the
+  // submit's own failure path, which drops the batch it was carrying.
+  if (removed && !(submitQueuedBatch && submitQueuedBatch.includes(removed))) {
+    dropOptimisticMessages([removed]);
+  }
   render();
 }
 
@@ -1669,6 +1675,7 @@ async function submitQueued() {
   // prompts that were queued when it started, even though this runs synchronously before the first
   // await; a later send appends to `queued` without joining this request.
   const batch = queued.slice();
+  submitQueuedBatch = batch;
   submitQueuedPromise = submitQueuedOnce(batch);
   try {
     const result = await submitQueuedPromise;
@@ -1676,6 +1683,8 @@ async function submitQueued() {
     return result;
   } finally {
     submitQueuedPromise = null;
+    const inFlight = submitQueuedBatch || [];
+    submitQueuedBatch = null;
     const shouldSubmitAgain = submitQueuedAgain;
     submitQueuedAgain = false;
     if (!succeeded) {
@@ -1684,8 +1693,11 @@ async function submitQueued() {
       // too). That covers more than this batch: a send composed while the POST was in flight only
       // set that flag, so it never got a request of its own either. `queued` is exactly the
       // unaccepted set - a batch is spliced out of it only on success - so every stand-in still
-      // keyed to a prompt in it is standing in for a message the server does not have.
-      dropOptimisticMessages(queued);
+      // keyed to a prompt in it is standing in for a message the server does not have. The
+      // in-flight batch joins it because a prompt the user took back mid-request left `queued`
+      // without being dropped, and this refusal is the answer that says nothing was delivered;
+      // a prompt in both lists is dropped once, since the second pass finds no stand-in.
+      dropOptimisticMessages([...queued, ...inFlight]);
     } else if (!ended && shouldSubmitAgain) {
       if (queued.length) {
         submitQueued().catch(() => {});
