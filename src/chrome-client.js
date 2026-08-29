@@ -751,10 +751,23 @@ function dropOptimisticMessages(prompts) {
     if (forgetMessage(id)) removed = true;
   }
   if (!removed) return;
+  clampSeenReplyCounts();
   renderChat();
   if (openThreadRootId) {
     if (messagesById.has(openThreadRootId)) renderThread(openThreadRootId);
     else closeThread();
+  }
+}
+
+// A thread is read up to the replies it actually has. Marking one seen counts the optimistic
+// stand-ins on screen, so retracting one has to give its count back: a seen count left above the
+// live reply count would silently absorb the next real reply and paint it as already read.
+function clampSeenReplyCounts() {
+  if (!seenReplyCount.size) return;
+  const { repliesByRoot } = groupThreads(orderedMessages());
+  for (const [rootId, seen] of seenReplyCount) {
+    const present = (repliesByRoot.get(rootId) || []).length;
+    if (seen > present) seenReplyCount.set(rootId, present);
   }
 }
 

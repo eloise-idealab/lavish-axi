@@ -801,6 +801,34 @@ test("a refused thread reply removes its optimistic bubble from the open thread"
   assert.equal(threadHtml.includes("Root message"), true, "the durable root is untouched");
 });
 
+// Sending a thread reply marks the thread seen while the reply is still an unaccepted stand-in.
+// When the server refuses that batch the stand-in goes, so the seen count has to come back down
+// with it - otherwise it absorbs the next real reply and shows the user a genuine agent reply they
+// have never read as already read.
+test("a refused thread reply does not make the next real agent reply read", async () => {
+  const chrome = await refusingChrome(async () => ({ ok: false, status: 400, json: async () => ({}) }));
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root message", at: 1 }] }),
+  });
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "reply that never lands";
+  chrome.element("threadSend").onclick();
+
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  assert.equal(chrome.threadingUnread("root1"), 0, "a thread with no replies has nothing unread");
+
+  chrome.element("threadBack").dispatch("click", {});
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ id: "r1", role: "agent", text: "a real answer", reply_to: "root1", at: 2 }),
+  });
+
+  assert.equal(chrome.threadingUnread("root1"), 1, "the agent's reply is unread");
+  const html = chrome.chatLogHtml();
+  assert.match(html, /thread-chip unread/);
+  assert.match(html, /1 new/);
+});
+
 // A second message can be composed while the first batch's POST is still in flight. That later
 // send finds submitQueued already running, so it only raises the "submit again" flag - it never
 // gets a POST of its own. When the in-flight batch then fails, that flag is dropped along with it,
