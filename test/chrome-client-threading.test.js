@@ -829,6 +829,49 @@ test("a refused thread reply does not make the next real agent reply read", asyn
   assert.match(html, /1 new/);
 });
 
+// The same defect with the other ordering: a real agent reply lands while the refused batch is
+// still in flight, so it already occupies the count the retracted stand-in was credited with.
+// Retraction has to give back its OWN reply, not settle for the count adding up.
+test("a refused thread reply does not absorb an agent reply that landed while it was in flight", async () => {
+  /** @type {() => void} */
+  let releasePost = () => {};
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).includes("/prompts")) return { ok: true, json: async () => ({}) };
+      return new Promise((resolve) => {
+        releasePost = () => resolve({ ok: false, status: 400, json: async () => ({}) });
+      });
+    },
+  });
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ id: "root1", role: "agent", text: "Root message", at: 1 }] }),
+  });
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "reply that never lands";
+  chrome.element("threadSend").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  chrome.element("threadBack").dispatch("click", {});
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ id: "r1", role: "agent", text: "a real answer", reply_to: "root1", at: 2 }),
+  });
+  assert.equal(chrome.threadingUnread("root1"), 1, "a reply into a closed thread is unread on arrival");
+
+  releasePost();
+  await flushPromises();
+
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "reply that never lands"),
+    false,
+    "the refused stand-in is gone",
+  );
+  assert.equal(chrome.threadingUnread("root1"), 1, "the agent's reply is still unread after the refusal");
+  const html = chrome.chatLogHtml();
+  assert.match(html, /thread-chip unread/);
+  assert.match(html, /1 new/);
+});
+
 // A second message can be composed while the first batch's POST is still in flight. That later
 // send finds submitQueued already running, so it only raises the "submit again" flag - it never
 // gets a POST of its own. When the in-flight batch then fails, that flag is dropped along with it,

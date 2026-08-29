@@ -743,15 +743,21 @@ function forgetMessage(id) {
 // shows the user a message that was never persisted or delivered. The prompts themselves stay
 // queued as pills, which is the surface that still lets the user retry or remove them.
 function dropOptimisticMessages(prompts) {
+  /** @type {Map<string, number>} */
+  const droppedByRoot = new Map();
   let removed = false;
   for (const prompt of prompts) {
     const id = optimisticMessageIds.get(prompt);
     if (!id) continue;
     optimisticMessageIds.delete(prompt);
-    if (forgetMessage(id)) removed = true;
+    // Resolve the root BEFORE forgetting the stand-in - afterwards its reply_to chain is gone.
+    const rootId = resolveRootId(id, messagesById);
+    if (!forgetMessage(id)) continue;
+    removed = true;
+    if (rootId !== String(id)) droppedByRoot.set(rootId, (droppedByRoot.get(rootId) || 0) + 1);
   }
   if (!removed) return;
-  clampSeenReplyCounts();
+  settleSeenReplyCounts(droppedByRoot);
   renderChat();
   if (openThreadRootId) {
     if (messagesById.has(openThreadRootId)) renderThread(openThreadRootId);
@@ -759,15 +765,19 @@ function dropOptimisticMessages(prompts) {
   }
 }
 
-// A thread is read up to the replies it actually has. Marking one seen counts the optimistic
-// stand-ins on screen, so retracting one has to give its count back: a seen count left above the
-// live reply count would silently absorb the next real reply and paint it as already read.
-function clampSeenReplyCounts() {
+// Marking a thread seen counts the optimistic stand-ins on screen, so retracting one has to hand
+// that credit back per reply - not merely cap the total. A real reply that landed while the POST
+// was in flight takes the retracted one's place in the count, so a cap alone would find nothing to
+// trim and let the seen count absorb an agent reply the user never opened. The cap still runs
+// beside the refund, so a seen count can never exceed the replies actually present either.
+/** @param {Map<string, number>} droppedByRoot */
+function settleSeenReplyCounts(droppedByRoot) {
   if (!seenReplyCount.size) return;
   const { repliesByRoot } = groupThreads(orderedMessages());
   for (const [rootId, seen] of seenReplyCount) {
     const present = (repliesByRoot.get(rootId) || []).length;
-    if (seen > present) seenReplyCount.set(rootId, present);
+    const settled = Math.max(0, Math.min(seen - (droppedByRoot.get(rootId) || 0), present));
+    if (settled !== seen) seenReplyCount.set(rootId, settled);
   }
 }
 
