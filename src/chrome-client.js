@@ -741,28 +741,40 @@ function forgetMessage(id) {
 // the stand-in. A batch the server refused (an ended session, an atomic 400 reject) or a request
 // that never landed produces no such message, so the stand-in has to go - otherwise the transcript
 // shows the user a message that was never persisted or delivered. The prompts themselves stay
-// queued as pills, which is the surface that still lets the user retry or remove them.
+// queued as pills, which is the surface that still lets the user retry it or take it back for good.
+// Retracting a stand-in is keyed on CONSUMING its optimisticMessageIds entry, never on removing it
+// from the model: a chat-sync rebuild drops every stand-in it does not carry, so by the time the
+// refusal lands the bubble is often already gone while the seen credit it bought is still standing.
 function dropOptimisticMessages(prompts) {
   /** @type {Map<string, number>} */
   const droppedByRoot = new Map();
+  let consumed = false;
   let removed = false;
   for (const prompt of prompts) {
     const id = optimisticMessageIds.get(prompt);
     if (!id) continue;
     optimisticMessageIds.delete(prompt);
-    // Resolve the root BEFORE forgetting the stand-in - afterwards its reply_to chain is gone.
-    const rootId = resolveRootId(id, messagesById);
-    if (!forgetMessage(id)) continue;
-    removed = true;
-    if (rootId !== String(id)) droppedByRoot.set(rootId, (droppedByRoot.get(rootId) || 0) + 1);
+    consumed = true;
+    // The prompt itself names the thread it was written into, so the root outlives the stand-in.
+    const rootId = optimisticPromptRoot(prompt);
+    if (forgetMessage(id)) removed = true;
+    if (rootId) droppedByRoot.set(rootId, (droppedByRoot.get(rootId) || 0) + 1);
   }
-  if (!removed) return;
-  settleSeenReplyCounts(droppedByRoot);
+  if (!consumed) return;
+  const settled = settleSeenReplyCounts(droppedByRoot);
+  if (!removed && !settled) return;
   renderChat();
   if (openThreadRootId) {
     if (messagesById.has(openThreadRootId)) renderThread(openThreadRootId);
     else closeThread();
   }
+}
+
+// The thread a retracted prompt was written into: its own reply_to, walked to a root. A prompt with
+// no reply_to stood in for a root message, which counts toward no thread's reply count.
+function optimisticPromptRoot(prompt) {
+  const replyTo = prompt && prompt.reply_to != null ? String(prompt.reply_to) : "";
+  return replyTo ? resolveRootId(replyTo, messagesById) : "";
 }
 
 // Marking a thread seen counts the optimistic stand-ins on screen, so retracting one has to hand
@@ -772,13 +784,18 @@ function dropOptimisticMessages(prompts) {
 // beside the refund, so a seen count can never exceed the replies actually present either.
 /** @param {Map<string, number>} droppedByRoot */
 function settleSeenReplyCounts(droppedByRoot) {
-  if (!seenReplyCount.size) return;
+  if (!seenReplyCount.size) return false;
   const { repliesByRoot } = groupThreads(orderedMessages());
+  let changed = false;
   for (const [rootId, seen] of seenReplyCount) {
     const present = (repliesByRoot.get(rootId) || []).length;
     const settled = Math.max(0, Math.min(seen - (droppedByRoot.get(rootId) || 0), present));
-    if (settled !== seen) seenReplyCount.set(rootId, settled);
+    if (settled !== seen) {
+      seenReplyCount.set(rootId, settled);
+      changed = true;
+    }
   }
+  return changed;
 }
 
 // Rebuild the whole model from the authoritative transcript.
@@ -1316,8 +1333,11 @@ function scrollChatToLatest() {
 
 function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
-  queued.splice(index, 1);
+  const [removed] = queued.splice(index, 1);
   persistQueuedPrompts();
+  // A prompt is spliced out of `queued` on success alone, so one removed by hand was never
+  // accepted: its stand-in has to go the same way a refused batch's does, credit included.
+  if (removed) dropOptimisticMessages([removed]);
   render();
 }
 
@@ -3834,6 +3854,7 @@ if (globalThis.__lavishTest) {
   globalThis.__lavishTest.unreadReplyCount = unreadReplyCount;
   globalThis.__lavishTest.isThreadUnread = isThreadUnread;
   globalThis.__lavishTest.threadUnreadCount = threadUnreadCount;
+  globalThis.__lavishTest.removeQueuedPrompt = removeQueuedPrompt;
 }
 
 // Reaching this line is the only proof that this file parsed and ran to completion. The inline

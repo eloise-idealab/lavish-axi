@@ -455,6 +455,11 @@ export async function createChromeHarness({
     threadingUnread(rootId) {
       return context.__lavishTest.threadUnreadCount(rootId);
     },
+    // The pills are written with innerHTML, which this DOM does not parse into children, so the
+    // close button's own click handler is unreachable here; call what that handler calls.
+    removeQueuedPrompt(index) {
+      return context.__lavishTest.removeQueuedPrompt(index);
+    },
     // The joined innerHTML of every direct child of #chatLog.
     chatLogHtml() {
       return element("chatLog")

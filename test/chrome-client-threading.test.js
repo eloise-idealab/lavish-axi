@@ -917,3 +917,79 @@ test("a failed send removes the optimistic bubble of a message queued while it w
     "both prompts stay queued as pills, which is the surface that still lets the user retry them",
   );
 });
+
+// A chat-sync rebuilds the model wholesale from the server's transcript, which never carries a
+// stand-in the server refused. Once one has landed, the refusal that follows finds nothing left to
+// remove - but the seen credit that stand-in bought at send time is still standing, so settlement
+// has to key on retracting the prompt, not on whether its bubble was still in the model.
+test("a refused thread reply is settled even when a chat-sync already dropped its stand-in", async () => {
+  /** @type {() => void} */
+  let releasePost = () => {};
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).includes("/prompts")) return { ok: true, json: async () => ({}) };
+      return new Promise((resolve) => {
+        releasePost = () => resolve({ ok: false, status: 400, json: async () => ({}) });
+      });
+    },
+  });
+  const syncChat = (chat) => chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat }) });
+  const root = { id: "root1", role: "agent", text: "Root message", at: 1 };
+  syncChat([root]);
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "reply that never lands";
+  chrome.element("threadSend").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  chrome.element("threadBack").dispatch("click", {});
+
+  syncChat([root, { id: "r1", role: "agent", text: "a real answer", reply_to: "root1", at: 2 }]);
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "reply that never lands"),
+    false,
+    "the rebuild already dropped the stand-in the refusal has yet to retract",
+  );
+
+  releasePost();
+  await flushPromises();
+
+  assert.equal(chrome.threadingUnread("root1"), 1, "the agent's reply is unread: nobody opened that thread");
+  const html = chrome.chatLogHtml();
+  assert.match(html, /thread-chip unread/);
+  assert.match(html, /1 new/);
+});
+
+// Removing a queued pill is the user taking a prompt back for good. A prompt leaves `queued` on a
+// successful POST alone, so one still in it was never accepted: its stand-in is as phantom as a
+// refused batch's, and it carries the same seen credit.
+test("taking back a queued thread reply retracts its stand-in and the seen credit it bought", async () => {
+  const chrome = await createChromeHarness();
+  const syncChat = (chat) => chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat }) });
+  const root = { id: "root1", role: "agent", text: "Root message", at: 1 };
+  syncChat([root]);
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "never mind";
+  chrome.element("threadSend").onclick();
+  chrome.element("threadBack").dispatch("click", {});
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["never mind"],
+    "the reply is queued as a pill, unsent while no snapshot has answered",
+  );
+
+  chrome.removeQueuedPrompt(0);
+
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "never mind"),
+    false,
+    "the stand-in for a prompt the user took back is gone",
+  );
+  assert.equal(chrome.chatLogHtml().includes("never mind"), false, "off screen too");
+
+  syncChat([root, { id: "r1", role: "agent", text: "a real answer", reply_to: "root1", at: 2 }]);
+
+  assert.equal(chrome.threadingUnread("root1"), 1, "the reply that arrives next is unread, not absorbed");
+  const html = chrome.chatLogHtml();
+  assert.match(html, /thread-chip unread/);
+  assert.match(html, /1 new/);
+});
