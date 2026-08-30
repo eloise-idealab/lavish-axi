@@ -764,6 +764,12 @@ function dropOptimisticMessages(prompts) {
   if (!consumed) return;
   const settled = settleSeenReplyCounts(droppedByRoot);
   if (!removed && !settled) return;
+  repaintThreadSurfaces();
+}
+
+// The one repaint every seen-count change goes through, so a debit and a credit land on screen the
+// same way.
+function repaintThreadSurfaces() {
   renderChat();
   if (openThreadRootId) {
     if (messagesById.has(openThreadRootId)) renderThread(openThreadRootId);
@@ -786,7 +792,9 @@ function optimisticPromptRoot(prompt) {
 // nobody dropped keeps its credit untouched, because `seen > present` there is the transient state
 // of a chat-sync rebuild that dropped a stand-in whose POST is still in flight - `unreadReplyCount`
 // floors at 0 so it costs nothing, while zeroing the credit is permanent and paints a false unread
-// badge on the user's own reply the moment that POST lands.
+// badge on the user's own reply the moment that POST lands. It is also only half a pair: a refund is
+// a debit that `creditDeliveredSeenReplyCounts` hands back if the retracted prompt is later retried
+// from its pill and accepted, so a retry ends exactly where an uninterrupted send would have.
 /** @param {Map<string, number>} droppedByRoot */
 function settleSeenReplyCounts(droppedByRoot) {
   if (!seenReplyCount.size) return false;
@@ -801,6 +809,31 @@ function settleSeenReplyCounts(droppedByRoot) {
       seenReplyCount.set(rootId, settled);
       changed = true;
     }
+  }
+  return changed;
+}
+
+// The credit half of that pair, and it is conditional because an unconditional one is worse than the
+// bug it fixes. `markThreadSeen` SETS a thread's seen count from what is present, so a stand-in still
+// on screen at delivery was already counted; crediting it again pushes seen past the replies present
+// and silently swallows the next real agent reply. A credit is owed ONLY to a prompt whose stand-in
+// was actually debited, and a consumed entry in `optimisticMessageIds` is exactly what its absence
+// here records - `dropOptimisticMessages` is the only thing that removes one, and delivery never
+// does. A root the user never opened has no seen entry and must not gain one, or an unopened thread
+// would come back marked read.
+/**
+ * @param {any[]} prompts
+ * @returns {boolean}
+ */
+function creditDeliveredSeenReplyCounts(prompts) {
+  if (!seenReplyCount.size) return false;
+  let changed = false;
+  for (const prompt of prompts) {
+    if (optimisticMessageIds.has(prompt)) continue;
+    const rootId = optimisticPromptRoot(prompt);
+    if (!rootId || !seenReplyCount.has(rootId)) continue;
+    seenReplyCount.set(rootId, (seenReplyCount.get(rootId) || 0) + 1);
+    changed = true;
   }
   return changed;
 }
@@ -1755,6 +1788,7 @@ async function submitQueuedOnce(prompts) {
     if (index !== -1) queued.splice(index, 1);
   }
   persistQueuedPrompts();
+  if (creditDeliveredSeenReplyCounts(prompts)) repaintThreadSurfaces();
   render();
   if (shouldEndSession) {
     endAfterSubmit = false;

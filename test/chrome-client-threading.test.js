@@ -1160,3 +1160,82 @@ test("taking back an unrelated prompt leaves an in-flight thread reply's seen cr
   );
   assert.match(chrome.chatLogHtml(), /thread-chip unread/);
 });
+
+// A refund is a debit, and a debit nobody pays back is its own bug. The refused prompt stays queued
+// as a pill, so the user retries it from there - no new stand-in is minted and the closed thread is
+// never re-marked seen, which left the seen count one short of the reply that then really landed.
+test("retrying a refused thread reply hands its refunded seen credit back on delivery", async () => {
+  let posts = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).includes("/prompts")) return { ok: true, json: async () => ({}) };
+      posts += 1;
+      if (posts === 1) return { ok: false, status: 400, json: async () => ({}) };
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  const syncChat = (chat) => chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat }) });
+  const root = { id: "root1", role: "agent", text: "Root message", at: 1 };
+  syncChat([root]);
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "worth another try";
+  chrome.element("threadSend").onclick();
+  chrome.element("threadBack").dispatch("click", {});
+
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  assert.equal(posts, 1, "the first POST went out and was refused");
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["worth another try"],
+    "an atomic rejection keeps the prompt queued as a pill for the user to retry",
+  );
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "worth another try"),
+    false,
+    "its stand-in was retracted, refunding the credit marking the thread seen had bought",
+  );
+
+  chrome.element("send").click();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  assert.equal(posts, 2, "the retry reached the server");
+  assert.deepEqual(chrome.queued(), [], "and was accepted, so the pill is gone");
+
+  syncChat([root, { id: "r1", role: "user", text: "worth another try", reply_to: "root1", at: 2 }]);
+
+  assert.equal(chrome.threadingUnread("root1"), 0, "the user's own retried reply is not unread");
+  assert.doesNotMatch(chrome.chatLogHtml(), /thread-chip unread/);
+});
+
+// The credit has to stay conditional. `markThreadSeen` SETS the count from what is on screen, so an
+// ordinary send was already counted through its stand-in; crediting it again on delivery pushes seen
+// past the replies present and the next real agent reply lands already marked read.
+test("an uninterrupted thread reply is not credited twice, so the agent's answer still reads unread", async () => {
+  const chrome = await createChromeHarness();
+  const syncChat = (chat) => chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat }) });
+  const root = { id: "root1", role: "agent", text: "Root message", at: 1 };
+  syncChat([root]);
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "lands first time";
+  chrome.element("threadSend").onclick();
+  chrome.element("threadBack").dispatch("click", {});
+
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  assert.deepEqual(chrome.queued(), [], "nothing failed anywhere: the batch was accepted");
+
+  syncChat([root, { id: "r1", role: "user", text: "lands first time", reply_to: "root1", at: 2 }]);
+  assert.equal(chrome.threadingUnread("root1"), 0, "the durable copy of the user's own reply is read");
+
+  syncChat([
+    root,
+    { id: "r1", role: "user", text: "lands first time", reply_to: "root1", at: 2 },
+    { id: "r2", role: "agent", text: "a real answer", reply_to: "root1", at: 3 },
+  ]);
+
+  assert.equal(chrome.threadingUnread("root1"), 1, "the agent's reply is unread, not swallowed by an inflated count");
+  const html = chrome.chatLogHtml();
+  assert.match(html, /thread-chip unread/);
+  assert.match(html, /1 new/);
+});
