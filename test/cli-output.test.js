@@ -3048,10 +3048,123 @@ test("streamMessageRecord carries a fatal artifact failure and does NOT count it
 });
 
 test("streamMessageRecord does NOT treat an annotation-only frame as a user message (MEDIUM regression)", () => {
-  const { isUserMessage } = streamMessageRecord({
+  const { record, isUserMessage } = streamMessageRecord({
     prompts: [{ tag: "h1", prompt: "tighten this", selector: "h1", text: "Title" }],
   });
   assert.equal(isUserMessage, false);
+  assert.equal(record.type, "feedback", "a batch with no message prompt is feedback, whatever else it carries");
+});
+
+// An image-only send carries no typed text, so the classifier that keyed off `prompt` alone read it
+// as an annotation: it never counted toward `delivered`, never satisfied `--once`, and lost the id
+// `--reply-to` needs. Its `text` still has to stay empty - the transcript's "Image message" label is
+// display copy, and an agent handed it could not tell it from a user who typed those words.
+test("streamMessageRecord counts an image-only send as a user message without borrowing its label", () => {
+  const { record, isUserMessage } = streamMessageRecord({
+    id: "msg-9",
+    prompts: [
+      {
+        tag: "message",
+        prompt: "",
+        id: "msg-9",
+        attachments: [{ id: `${"a".repeat(64)}.png`, name: "shot.png", path: "/tmp/shot.png" }],
+      },
+    ],
+    dom_snapshot: "snap",
+  });
+  assert.equal(isUserMessage, true);
+  assert.equal(record.type, "message");
+  assert.equal(record.id, "msg-9");
+  assert.equal(record.text, "");
+  assert.equal(record.prompts[0].attachments.length, 1);
+});
+
+// The whole agent path, end to end: a real server, a real `lavish-axi stream --once` child, and an
+// image-only send queued before it attaches. The child must print that message and EXIT. Before
+// this the server never classified it as a user message, so it never ended the response - the child
+// blocked forever on a batch the destructive take had already consumed - and `delivered` reported 0.
+test("`stream --once` counts an image-only send as delivered and exits instead of blocking", async () => {
+  const stateDir = await realpath(await mkdtemp(`${os.tmpdir()}/lavish-axi-stream-image-`));
+  const artifact = path.join(stateDir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const bin = fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url));
+  // The CLI reuses a running server only when /health reports its own version, so serve as VERSION.
+  const server = await serve({ port: 0, stateFile: path.join(stateDir, "state.json"), version: VERSION });
+  const base = `http://127.0.0.1:${server.port}`;
+  const PNG_2x1 = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR42mP8z8BQz0BkYGAAADAAA/8W1p0AAAAASUVORK5CYII=",
+    "base64",
+  );
+  try {
+    const { key } = await (
+      await fetch(`${base}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: artifact }),
+      })
+    ).json();
+    const { attachment } = await (
+      await fetch(`${base}/api/${key}/attachments`, {
+        method: "POST",
+        headers: { "content-type": "image/png", origin: base },
+        body: PNG_2x1,
+      })
+    ).json();
+    const queued = await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({
+        prompts: [{ tag: "message", prompt: "", attachments: [{ id: attachment.id, name: "shot.png" }] }],
+      }),
+    });
+    assert.equal(queued.status, 200);
+
+    // spawn, never spawnSync: the server answering this child runs on THIS event loop.
+    const run = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [bin, "stream", "--once", artifact], {
+        cwd: stateDir,
+        env: {
+          ...process.env,
+          LAVISH_AXI_STATE_DIR: stateDir,
+          LAVISH_AXI_PORT: String(server.port),
+          LAVISH_AXI_TELEMETRY: "0",
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+      });
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, 30_000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code, stdout, stderr, timedOut });
+      });
+    });
+
+    assert.equal(run.timedOut, false, `--once must return on an image-only message\n${run.stderr}`);
+    assert.equal(run.code, 0, `stream exited ${run.code}\n${run.stdout}\n${run.stderr}`);
+    const records = run.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("{"))
+      .map((line) => JSON.parse(line));
+    assert.equal(records.length, 1, `one NDJSON delivery line\n${run.stdout}`);
+    assert.equal(records[0].type, "message");
+    assert.ok(records[0].id, "the agent is handed the id it needs for --reply-to");
+    assert.equal(records[0].text, "", "the transcript's display label never reaches the agent as typed words");
+    assert.equal(records[0].prompts[0].attachments.length, 1);
+    assert.match(run.stdout, /delivered:\s*1/, `the summary counts it as delivered\n${run.stdout}`);
+  } finally {
+    await server.close();
+    await rm(stateDir, { force: true, recursive: true });
+  }
 });
 
 test("drainSseBuffer emits every complete buffered frame, even after the handler signals stop (I1 regression)", () => {

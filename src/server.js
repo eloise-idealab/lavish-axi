@@ -66,7 +66,7 @@ import {
   sanitizeListenHosts,
 } from "./paths.js";
 import { detectTailscale } from "./tailscale.js";
-import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
+import { canonicalFile, isTranscriptMessage, SessionStore, sessionKey } from "./session-store.js";
 import { generateSharePassword } from "./share-password.js";
 import {
   ACCEPTED_IMAGE_MIME,
@@ -847,8 +847,8 @@ export async function serve({
             const dom = feedback.dom_snapshot || "";
             // One SSE frame per user message keeps the "one subagent per message" contract; fatal
             // artifact failures (and any non-message prompts) ride along on the batch's first frame.
-            const messages = prompts.filter((p) => p && p.tag === "message" && p.prompt);
-            const extras = prompts.filter((p) => !(p && p.tag === "message" && p.prompt));
+            const messages = prompts.filter((p) => p && isTranscriptMessage(p));
+            const extras = prompts.filter((p) => !(p && isTranscriptMessage(p)));
             if (once && messages.length > 0) {
               // --once delivers exactly one user message and requeues the rest of the batch, so a
               // single-shot harness never loses the tail of a multi-message batch.

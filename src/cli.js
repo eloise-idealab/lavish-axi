@@ -36,7 +36,7 @@ import {
 import { findPlaybook, listPlaybooks, playbookIds, PLAYBOOK_ROUTER_HELP } from "./playbooks.js";
 import { analyzeSelfPaint, SELF_PAINT_WARNING } from "./self-paint.js";
 import { resolveDesignAssetPath, serve } from "./server.js";
-import { canonicalFile, sessionKey, SessionStore } from "./session-store.js";
+import { canonicalFile, isTranscriptMessage, sessionKey, SessionStore } from "./session-store.js";
 import { generateSharePassword } from "./share-password.js";
 import { initDefaultTelemetry } from "./telemetry.js";
 
@@ -505,13 +505,15 @@ function safeJsonParse(text) {
 }
 
 // Build the NDJSON record for one `/api/stream` `message` frame and classify it. A frame is a
-// deliverable user message only when it carries a message-tagged prompt; the server also emits
+// deliverable user message only when it carries a prompt the transcript recorded as one - the same
+// `isTranscriptMessage` the store mints ids with, so an image-only send is a message here too and
+// its `text` stays empty rather than borrowing the transcript's display label; the server also emits
 // `message` frames for annotation- or layout-warning-only batches (no user message). Those still
 // reach the agent but must not count toward `delivered` or satisfy `--once`. `isUserMessage`
 // captures that distinction so the stream loop treats the two kinds correctly.
 export function streamMessageRecord(payload) {
   const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
-  const message = prompts.find((p) => p && p.tag === "message" && p.prompt) || null;
+  const message = prompts.find((p) => p && isTranscriptMessage(p)) || null;
   const replyTo = payload.reply_to || message?.reply_to;
   const record = {
     type: message ? "message" : "feedback",

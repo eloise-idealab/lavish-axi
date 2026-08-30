@@ -729,22 +729,27 @@ export function sessionKey(file) {
   return crypto.createHash("sha256").update(file).digest("hex").slice(0, 16);
 }
 
-// Returns `{ prompt, malformed }`: `malformed` is non-empty when the payload's
-// `attachments` field exists but cannot be honored as written, which fails the
-// whole batch rather than being normalized away (C4, see queuePrompts).
 // The transcript label for a message the user sent as images alone. The chrome renders the same
 // string on that send's optimistic bubble (src/chrome-client.js, sendQueued's
-// `text: text || "Image message"`), so the two surfaces change together.
+// `text: text || "Image message"`), so the two surfaces change together. It is display copy, and
+// deliberately never reaches an agent: a delivery record carrying it could not be told apart from
+// a user who typed those words, so `/api/stream` and `streamMessageRecord` leave `text` empty.
 const IMAGE_ONLY_MESSAGE_TEXT = "Image message";
 
 // A message prompt earns a transcript entry, and the server-minted id that goes with it, when it
-// carries something the user can see afterwards: typed text, or images alone. Both queuePrompts
-// sites read this one predicate so an id and its chat entry can never be minted apart.
-function isTranscriptMessage(prompt) {
+// carries something the user can see afterwards: typed text, or images alone. This is the one
+// predicate that answers "is this a user message": both queuePrompts sites read it so an id and
+// its chat entry can never be minted apart, and the stream's per-message split (src/server.js) and
+// `streamMessageRecord` (src/cli.js) read it so the message the transcript records is the message
+// the agent is handed.
+export function isTranscriptMessage(prompt) {
   if (prompt.tag !== "message") return false;
   return Boolean(prompt.prompt || (Array.isArray(prompt.attachments) && prompt.attachments.length > 0));
 }
 
+// Returns `{ prompt, malformed }`: `malformed` is non-empty when the payload's
+// `attachments` field exists but cannot be honored as written, which fails the
+// whole batch rather than being normalized away (C4, see queuePrompts).
 function normalizePrompt(prompt) {
   const normalized = {
     uid: String(prompt.uid || ""),

@@ -6218,25 +6218,80 @@ async function collectSseFrames(body, predicate, timeoutMs = 2000) {
       ]);
       if (done) break;
       if (value) buffer += decoder.decode(value, { stream: true });
-      let boundary;
-      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
-        const raw = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        let event = "message";
-        const dataLines = [];
-        for (const line of raw.split("\n")) {
-          if (line.startsWith(":")) continue;
-          if (line.startsWith("event:")) event = line.slice(6).trim();
-          else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
-        }
-        if (dataLines.length > 0) frames.push({ event, data: JSON.parse(dataLines.join("\n")) });
-      }
+      const parsed = parseSseFrames(buffer);
+      buffer = parsed.rest;
+      frames.push(...parsed.frames);
       if (predicate(frames)) break;
     }
   } finally {
     await reader.cancel().catch(() => {});
   }
   return frames;
+}
+
+// Splits every complete frame out of an SSE buffer and returns the trailing partial bytes, so an
+// incremental reader can carry them into the next read and a whole-body reader can ignore them.
+function parseSseFrames(buffer) {
+  const frames = [];
+  let rest = buffer;
+  let boundary;
+  while ((boundary = rest.indexOf("\n\n")) !== -1) {
+    const raw = rest.slice(0, boundary);
+    rest = rest.slice(boundary + 2);
+    let event = "message";
+    const dataLines = [];
+    for (const line of raw.split("\n")) {
+      if (line.startsWith(":")) continue;
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+    }
+    if (dataLines.length > 0) frames.push({ event, data: JSON.parse(dataLines.join("\n")) });
+  }
+  return { frames, rest };
+}
+
+// Reads a stream response to completion. The body only completes once the server ENDS the
+// response, so `null` means the connection was still open at the deadline - which is what a
+// single-shot `--once` harness experiences as a hang, and is invisible in the frames themselves.
+async function readSseFramesUntilResponseEnd(response, timeoutMs = 3000) {
+  const stillOpen = Symbol("still-open");
+  const settled = await Promise.race([
+    response.text().catch(() => ""),
+    new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(stillOpen), timeoutMs);
+      if (typeof timer.unref === "function") timer.unref();
+    }),
+  ]);
+  if (settled === stillOpen) return null;
+  return parseSseFrames(String(settled)).frames;
+}
+
+// A 2x1 PNG - the smallest body the upload route's magic-byte check accepts as a real image.
+const STREAM_PNG_2x1 = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR42mP8z8BQz0BkYGAAADAAA/8W1p0AAAAASUVORK5CYII=",
+  "base64",
+);
+
+// Uploads through the real route: the store re-derives every attachment from disk, so a prompt
+// referencing a fabricated id would be rejected as a whole batch instead of queuing.
+async function uploadStreamImage(base, key) {
+  const res = await fetch(`${base}/api/${key}/attachments`, {
+    method: "POST",
+    headers: { "content-type": "image/png", origin: base },
+    body: STREAM_PNG_2x1,
+  });
+  assert.equal(res.status, 200);
+  return (await res.json()).attachment;
+}
+
+async function queueStreamPrompts(base, key, prompts) {
+  const res = await fetch(`${base}/api/${key}/prompts`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: base },
+    body: JSON.stringify({ prompts }),
+  });
+  assert.equal(res.status, 200);
+  return res.json();
 }
 
 test("GET /api/stream pushes each queued user message as its own SSE frame (change #1)", async () => {
@@ -6716,6 +6771,176 @@ test("GET /api/stream?once=1 delivers exactly one user message and requeues the 
     const body = await poll.json();
     assert.equal(body.status, "feedback");
     assert.equal(body.prompts.find((p) => p.tag === "message").prompt, "second");
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// An image-only send - attachments and no typed text - is a user message: the store mints it an id
+// and records it in the transcript. The stream classified it as an "extra", so `once` never saw a
+// message, never set `stopped` and never ended the response: the single-shot harness blocked on a
+// batch the destructive take had already consumed.
+test("GET /api/stream?once=1 ends the response for an image-only message and carries its minted id", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-image-once-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+    const attachment = await uploadStreamImage(base, key);
+    await queueStreamPrompts(base, key, [
+      { tag: "message", prompt: "", attachments: [{ id: attachment.id, name: "shot.png" }] },
+    ]);
+
+    const streamRes = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}&once=1`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    assert.equal(streamRes.status, 200);
+
+    const frames = await readSseFramesUntilResponseEnd(streamRes);
+    assert.ok(frames, "a once stream must end the response for an image-only message, not hold it open");
+    const messages = frames.filter((f) => f.event === "message");
+    assert.equal(messages.length, 1);
+    assert.deepEqual(
+      messages[0].data.prompts.map((p) => [p.tag, p.prompt]),
+      [["message", ""]],
+      "the image-only prompt is the frame's user message, not an extra riding beside one",
+    );
+    assert.equal(messages[0].data.prompts[0].attachments.length, 1);
+    // The id is what `--reply-to` threads against, and the extras branch emits no `id` at all.
+    assert.equal(typeof messages[0].data.id, "string");
+    assert.ok(messages[0].data.id.length > 0, "the frame carries the server-minted message id");
+    assert.equal(messages[0].data.id, messages[0].data.prompts[0].id);
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/stream gives a mixed text + image-only batch one frame per message, each with its own id", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-image-mixed-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+    const attachment = await uploadStreamImage(base, key);
+    await queueStreamPrompts(base, key, [
+      { tag: "message", prompt: "typed words" },
+      { tag: "message", prompt: "", attachments: [{ id: attachment.id, name: "shot.png" }] },
+    ]);
+
+    const streamRes = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    assert.equal(streamRes.status, 200);
+    const frames = await collectSseFrames(
+      streamRes.body,
+      (all) => all.filter((f) => f.event === "message").length >= 2,
+    );
+    const messages = frames.filter((f) => f.event === "message");
+    assert.equal(messages.length, 2, "the image-only send gets a frame of its own, not a seat on the text frame");
+    assert.deepEqual(
+      messages.map((f) => f.data.prompts.map((p) => p.prompt)),
+      [["typed words"], [""]],
+    );
+    const ids = messages.map((f) => f.data.id);
+    assert.ok(
+      ids.every((id) => typeof id === "string" && id.length > 0),
+      `every message frame carries an id, got ${JSON.stringify(ids)}`,
+    );
+    assert.notEqual(ids[0], ids[1], "the two messages are separately addressable for --reply-to");
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/stream?once=1 delivers only the first of a mixed batch and requeues the image-only tail", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-image-once-tail-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+    const attachment = await uploadStreamImage(base, key);
+    await queueStreamPrompts(base, key, [
+      { tag: "message", prompt: "typed words" },
+      { tag: "message", prompt: "", attachments: [{ id: attachment.id, name: "shot.png" }] },
+    ]);
+
+    const streamRes = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}&once=1`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    assert.equal(streamRes.status, 200);
+    const frames = await readSseFramesUntilResponseEnd(streamRes);
+    assert.ok(frames, "the once stream ends the response");
+    const messages = frames.filter((f) => f.event === "message");
+    assert.equal(messages.length, 1);
+    assert.deepEqual(
+      messages[0].data.prompts.map((p) => p.prompt),
+      ["typed words"],
+      "exactly one user message is delivered - the image-only send does not ride along as an extra",
+    );
+
+    // The image-only message is requeued, not lost, and keeps the id already minted for it.
+    const poll = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=2000`);
+    const body = await poll.json();
+    assert.equal(body.status, "feedback");
+    assert.deepEqual(
+      body.prompts.map((p) => p.prompt),
+      [""],
+    );
+    assert.equal(body.prompts[0].attachments.length, 1);
+    assert.ok(body.prompts[0].id, "the requeued image-only message keeps its minted id");
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// The case the widened predicate must not swallow: a batch with no message prompt at all is still
+// not a user message. It rides the extras branch, which emits no `id` and never satisfies `once`.
+test("GET /api/stream still delivers an annotation-only batch on the extras branch with no message id", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-extras-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+    const streamRes = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    assert.equal(streamRes.status, 200);
+
+    await queueStreamPrompts(base, key, [{ tag: "h1", prompt: "tighten this", selector: "h1", text: "Title" }]);
+
+    const frames = await collectSseFrames(streamRes.body, (all) => all.some((f) => f.event === "message"));
+    const messages = frames.filter((f) => f.event === "message");
+    assert.equal(messages.length, 1);
+    assert.deepEqual(
+      messages[0].data.prompts.map((p) => [p.tag, p.prompt]),
+      [["h1", "tighten this"]],
+    );
+    assert.equal(messages[0].data.id, undefined, "an extras-only frame names no message to reply to");
+    assert.equal(messages[0].data.prompts[0].id, undefined, "and the annotation itself is never minted one");
   } finally {
     controller.abort();
     await server.close();
