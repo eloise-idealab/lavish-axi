@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.62](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.61...lavish-axi-v0.1.62) (2026-08-24)
+
+
+### Features
+
+* **artifact-sdk:** close an empty annotation card on Escape ([#293](https://github.com/kunchenguid/lavish-axi/issues/293)) ([2b563e1](https://github.com/kunchenguid/lavish-axi/commit/2b563e17a9cb70757d77a1b979c811482d71d3b9)), closes [#292](https://github.com/kunchenguid/lavish-axi/issues/292)
+
 ## [0.1.61](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.60...lavish-axi-v0.1.61) (2026-08-24)
 
 
