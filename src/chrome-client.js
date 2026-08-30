@@ -795,6 +795,15 @@ function optimisticPromptRoot(prompt) {
 // badge on the user's own reply the moment that POST lands. It is also only half a pair: a refund is
 // a debit that `creditDeliveredSeenReplyCounts` hands back if the retracted prompt is later retried
 // from its pill and accepted, so a retry ends exactly where an uninterrupted send would have.
+// KNOWN LIMITATION, reviewed and DECLINED 2026-08-29: that same rebuild reaches `seen` by a third
+// path this region does not cover. `syncChat` -> `markThreadSeen` SETS the count from a model that
+// `setMessages` has just cleared of every in-flight `local-` stand-in, so an agent reply landing
+// inside the POST window followed by Back before it resolves leaves a false unread badge on the
+// user's own reply until the thread is reopened, which self-heals it. It was declined rather than
+// patched because the obvious patch - keying the credit below off model presence instead of the
+// WeakMap - double-counts the retraction case above and silently swallows a real agent reply. A
+// correct fix makes `replyCountForRoot`/`markThreadSeen` count queued-but-undelivered thread replies
+// EXPLICITLY rather than inferring "was this counted?" from proxies.
 /** @param {Map<string, number>} droppedByRoot */
 function settleSeenReplyCounts(droppedByRoot) {
   if (!seenReplyCount.size) return false;
@@ -816,11 +825,18 @@ function settleSeenReplyCounts(droppedByRoot) {
 // The credit half of that pair, and it is conditional because an unconditional one is worse than the
 // bug it fixes. `markThreadSeen` SETS a thread's seen count from what is present, so a stand-in still
 // on screen at delivery was already counted; crediting it again pushes seen past the replies present
-// and silently swallows the next real agent reply. A credit is owed ONLY to a prompt whose stand-in
-// was actually debited, and a consumed entry in `optimisticMessageIds` is exactly what its absence
-// here records - `dropOptimisticMessages` is the only thing that removes one, and delivery never
-// does. A root the user never opened has no seen entry and must not gain one, or an unopened thread
-// would come back marked read.
+// and silently swallows the next real agent reply. The guard is a WeakMap-presence test, and absence
+// there has TWO sources, only one of which it was written for: (a) CONSUMED - `dropOptimisticMessages`
+// debited the stand-in and removed the entry, which is the only thing that ever removes one, since
+// delivery does not; and (b) NEVER PRESENT - `loadQueuedPrompts` rebuilds the queue from
+// sessionStorage into fresh objects, and `optimisticMessageIds` is keyed by the prompt object, so a
+// restored prompt matches nothing while `sanitizeQueuedPrompt` keeps its `reply_to`. So debit and
+// credit are not inverses over the same population: a restored queued thread reply is credited though
+// nothing ever debited it. That was accepted rather than tightened because it converges - the credit
+// anticipates exactly the one reply about to land, so a genuinely unread badge clears for the moment
+// between delivery and the batch's own chat-sync, which restores it. Benign, not invisible. A root
+// the user never opened has no seen entry and must not gain one, or an unopened thread would come
+// back marked read.
 /**
  * @param {any[]} prompts
  * @returns {boolean}
