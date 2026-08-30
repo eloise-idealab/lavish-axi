@@ -3181,6 +3181,16 @@ const STREAM_SIGNAL_CHILD_TIMEOUT_MS = STREAM_FLUSH_CEILING_MS * 10;
 // a real tail is always still queued inside the child when the signal lands. Asserting on a prefix
 // (non-empty stdout, "contains the id") would pass against the bug, which keeps the first 64 KB.
 const STREAM_SIGNAL_SNAPSHOT_BYTES = 256 * 1024;
+// Windows has no POSIX signals: subprocess.kill("SIGINT"/"SIGTERM") terminates the child
+// unconditionally instead of delivering the signal to its JavaScript handler, so the bounded flush
+// under test never runs there. Measured by emulating that termination locally - the child reports
+// code null (not 130/143), exits in ~3ms rather than waiting on the ceiling, and writes zero
+// complete NDJSON lines. There is no cross-platform way to drive it: the handler only fires for a
+// real console Ctrl-C event, which Node exposes no API to send. Same reason the SIGTERM poll
+// scenario above guards its handler assertions.
+const signalDeliveringOnly = {
+  skip: process.platform === "win32" ? "Windows kills the child instead of running its signal handler" : false,
+};
 
 async function withStreamSignalSession(run) {
   const stateDir = await realpath(await mkdtemp(`${os.tmpdir()}/lavish-axi-stream-signal-`));
@@ -3274,7 +3284,7 @@ function parseStreamRecords(stdout) {
     .map((line) => JSON.parse(line));
 }
 
-test("`stream` flushes a delivered message to stdout before exiting on a signal", async () => {
+test("`stream` flushes a delivered message to stdout before exiting on a signal", signalDeliveringOnly, async () => {
   await withStreamSignalSession(async ({ artifact, stateDir, port, queueBigMessage }) => {
     for (const signal of ["SIGTERM", "SIGINT"]) {
       await queueBigMessage(`flush me on ${signal}`);
@@ -3297,28 +3307,32 @@ test("`stream` flushes a delivered message to stdout before exiting on a signal"
   });
 });
 
-test("`stream` still exits within the flush ceiling when the consumer stops reading", async () => {
-  await withStreamSignalSession(async ({ artifact, stateDir, port, queueBigMessage }) => {
-    for (const signal of ["SIGINT", "SIGTERM"]) {
-      await queueBigMessage(`stalled on ${signal}`);
-      const run = await spawnStreamAndSignal({ artifact, stateDir, port, signal, drainAfterSignal: false });
-      assert.equal(run.timedOut, false, `${signal}: Ctrl-C must stay fatal against a consumer that never reads`);
-      assert.equal(
-        run.code,
-        STREAM_SIGNAL_EXIT_CODES[signal],
-        `${signal}: the ceiling path exits with the same code as the flushed path\n${run.stderr}`,
-      );
-      assert.ok(
-        run.elapsedMs >= STREAM_FLUSH_CEILING_MS / 2,
-        `${signal}: it waited on the unflushable bytes rather than exiting straight away (${run.elapsedMs}ms)`,
-      );
-      assert.ok(
-        run.elapsedMs < STREAM_FLUSH_CEILING_MS * 3,
-        `${signal}: the wait is bounded by the ceiling, not by the consumer (${run.elapsedMs}ms)`,
-      );
-    }
-  });
-});
+test(
+  "`stream` still exits within the flush ceiling when the consumer stops reading",
+  signalDeliveringOnly,
+  async () => {
+    await withStreamSignalSession(async ({ artifact, stateDir, port, queueBigMessage }) => {
+      for (const signal of ["SIGINT", "SIGTERM"]) {
+        await queueBigMessage(`stalled on ${signal}`);
+        const run = await spawnStreamAndSignal({ artifact, stateDir, port, signal, drainAfterSignal: false });
+        assert.equal(run.timedOut, false, `${signal}: Ctrl-C must stay fatal against a consumer that never reads`);
+        assert.equal(
+          run.code,
+          STREAM_SIGNAL_EXIT_CODES[signal],
+          `${signal}: the ceiling path exits with the same code as the flushed path\n${run.stderr}`,
+        );
+        assert.ok(
+          run.elapsedMs >= STREAM_FLUSH_CEILING_MS / 2,
+          `${signal}: it waited on the unflushable bytes rather than exiting straight away (${run.elapsedMs}ms)`,
+        );
+        assert.ok(
+          run.elapsedMs < STREAM_FLUSH_CEILING_MS * 3,
+          `${signal}: the wait is bounded by the ceiling, not by the consumer (${run.elapsedMs}ms)`,
+        );
+      }
+    });
+  },
+);
 
 test("drainSseBuffer emits every complete buffered frame, even after the handler signals stop (I1 regression)", () => {
   // Under --once the handler sets stop on the first user message. A multi-message batch that
