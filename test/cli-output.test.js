@@ -52,7 +52,9 @@ import {
   shouldRestartServer,
   startPollWaitReporter,
   stopCommand,
+  STREAM_FLUSH_CEILING_MS,
   streamBusyError,
+  streamInterruptedText,
   streamMessageRecord,
   telemetryCommandName,
   VERSION,
@@ -3165,6 +3167,157 @@ test("`stream --once` counts an image-only send as delivered and exits instead o
     await server.close();
     await rm(stateDir, { force: true, recursive: true });
   }
+});
+
+// stdout is `stream`'s delivery channel and /api/stream delivery is destructive: takeFeedback clears
+// the batch and finishFeedbackDelivery runs before the frame is written, so a record the CLI printed
+// but did not flush is a user message nothing will ever re-send. process.exit() discards buffered
+// bytes when stdout is a pipe, which is the loss these scenarios reproduce.
+const STREAM_SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 };
+// Derived from the flush ceiling rather than written as a second independent number: the ceiling is
+// the only wall clock this scenario depends on, and a child honoring it closes well inside this.
+const STREAM_SIGNAL_CHILD_TIMEOUT_MS = STREAM_FLUSH_CEILING_MS * 10;
+// Well past the 64 KB pipe buffer, so the record cannot fit in the reader's buffer plus the pipe and
+// a real tail is always still queued inside the child when the signal lands. Asserting on a prefix
+// (non-empty stdout, "contains the id") would pass against the bug, which keeps the first 64 KB.
+const STREAM_SIGNAL_SNAPSHOT_BYTES = 256 * 1024;
+
+async function withStreamSignalSession(run) {
+  const stateDir = await realpath(await mkdtemp(`${os.tmpdir()}/lavish-axi-stream-signal-`));
+  const artifact = path.join(stateDir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(stateDir, "state.json"), version: VERSION });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const { key } = await (
+      await fetch(`${base}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: artifact }),
+      })
+    ).json();
+    const queueBigMessage = async (text) => {
+      const queued = await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify({
+          prompts: [{ tag: "message", prompt: text }],
+          dom_snapshot: "d".repeat(STREAM_SIGNAL_SNAPSHOT_BYTES),
+        }),
+      });
+      assert.equal(queued.status, 200);
+    };
+    await run({ artifact, stateDir, port: server.port, queueBigMessage });
+  } finally {
+    await server.close();
+    await rm(stateDir, { force: true, recursive: true });
+  }
+}
+
+// Spawns the real `stream` command over a real pipe, waits for it to start writing its record, then
+// stops reading so the tail stays queued inside the child and signals it there. `drainAfterSignal`
+// picks which half is under test: true resumes reading once the child's own handler has announced
+// itself on stderr, so the flush can complete; false models a consumer that never reads again.
+function spawnStreamAndSignal({ artifact, stateDir, port, signal, drainAfterSignal }) {
+  const bin = fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url));
+  const interrupted = streamInterruptedText(artifact);
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [bin, "stream", artifact], {
+      cwd: stateDir,
+      env: {
+        ...process.env,
+        LAVISH_AXI_STATE_DIR: stateDir,
+        LAVISH_AXI_PORT: String(port),
+        LAVISH_AXI_TELEMETRY: "0",
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let signalledAt = 0;
+    let exit = null;
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (signalledAt) return;
+      child.stdout.pause();
+      signalledAt = Date.now();
+      child.kill(signal);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+      // Resume only once the handler has run. Resuming earlier would drain the queued bytes before
+      // the signal was even delivered, and an unflushed exit would then look identical to a flushed
+      // one - the test would pass against the very bug it exists to catch.
+      if (drainAfterSignal && signalledAt && stderr.includes(interrupted)) child.stdout.resume();
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, STREAM_SIGNAL_CHILD_TIMEOUT_MS);
+    // Measure at exit, not at close: a stdout left paused never ends on its own, so the ceiling
+    // scenario would otherwise hang here rather than in the child.
+    child.on("exit", (code, closedBy) => {
+      exit = { code, closedBy, elapsedMs: Date.now() - signalledAt };
+      child.stdout.resume();
+    });
+    child.on("close", () => {
+      clearTimeout(timer);
+      resolve({ ...exit, stdout, stderr, timedOut });
+    });
+  });
+}
+
+function parseStreamRecords(stdout) {
+  return stdout
+    .split("\n")
+    .filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line));
+}
+
+test("`stream` flushes a delivered message to stdout before exiting on a signal", async () => {
+  await withStreamSignalSession(async ({ artifact, stateDir, port, queueBigMessage }) => {
+    for (const signal of ["SIGTERM", "SIGINT"]) {
+      await queueBigMessage(`flush me on ${signal}`);
+      const run = await spawnStreamAndSignal({ artifact, stateDir, port, signal, drainAfterSignal: true });
+      assert.equal(run.timedOut, false, `${signal}: the bounded flush must not outlive the ceiling\n${run.stderr}`);
+      assert.equal(
+        run.code,
+        STREAM_SIGNAL_EXIT_CODES[signal],
+        `${signal}: the signal's exit code is part of the contract\n${run.stderr}`,
+      );
+      const records = parseStreamRecords(run.stdout);
+      assert.equal(records.length, 1, `${signal}: the delivered record survives as one complete JSON line`);
+      assert.equal(records[0].text, `flush me on ${signal}`);
+      assert.equal(
+        records[0].dom_snapshot.length,
+        STREAM_SIGNAL_SNAPSHOT_BYTES,
+        `${signal}: the whole record is flushed, not the first pipe-buffer's worth of it`,
+      );
+    }
+  });
+});
+
+test("`stream` still exits within the flush ceiling when the consumer stops reading", async () => {
+  await withStreamSignalSession(async ({ artifact, stateDir, port, queueBigMessage }) => {
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      await queueBigMessage(`stalled on ${signal}`);
+      const run = await spawnStreamAndSignal({ artifact, stateDir, port, signal, drainAfterSignal: false });
+      assert.equal(run.timedOut, false, `${signal}: Ctrl-C must stay fatal against a consumer that never reads`);
+      assert.equal(
+        run.code,
+        STREAM_SIGNAL_EXIT_CODES[signal],
+        `${signal}: the ceiling path exits with the same code as the flushed path\n${run.stderr}`,
+      );
+      assert.ok(
+        run.elapsedMs >= STREAM_FLUSH_CEILING_MS / 2,
+        `${signal}: it waited on the unflushable bytes rather than exiting straight away (${run.elapsedMs}ms)`,
+      );
+      assert.ok(
+        run.elapsedMs < STREAM_FLUSH_CEILING_MS * 3,
+        `${signal}: the wait is bounded by the ceiling, not by the consumer (${run.elapsedMs}ms)`,
+      );
+    }
+  });
 });
 
 test("drainSseBuffer emits every complete buffered frame, even after the handler signals stop (I1 regression)", () => {

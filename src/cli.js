@@ -48,6 +48,9 @@ const SHARE_VALUE_FLAGS = ["--password", "--token", "--site", "--update-key"];
 const AGENT_REPLY_FLAG = "--agent-reply";
 const REPLY_TO_FLAG = "--reply-to";
 const STREAM_VALUE_FLAGS = [AGENT_REPLY_FLAG, REPLY_TO_FLAG];
+// Hard ceiling on the stdout flush a `stream` signal handler waits for, so Ctrl-C can never hang on
+// a consumer that has stopped reading.
+export const STREAM_FLUSH_CEILING_MS = 2000;
 // `poll` ignores --reply-to - threading is a `stream` feature - but must still step over its value.
 const POLL_VALUE_FLAGS = [AGENT_REPLY_FLAG, REPLY_TO_FLAG, "--timeout-ms"];
 const COMMANDS = new Set([
@@ -435,9 +438,24 @@ async function streamCommand(args) {
     throw new AxiError(`Lavish Editor stream failed: ${response.status}`, "SERVER_ERROR");
   }
 
+  // Bounded flush. stdout is the delivery channel and /api/stream delivery is destructive, so a
+  // frame already written but still buffered is a permanently lost user message: process.exit()
+  // discards it when stdout is a pipe. Wait for the queued bytes, but never longer than the
+  // ceiling - an unbounded wait would let a consumer that stopped reading make Ctrl-C hang. The
+  // write(cb) form (not "drain", which only fires after a write that crossed highWaterMark) is what
+  // makes the wait exact: the write queue is FIFO, so an empty write's callback runs last.
   const onSignal = (signal) => {
+    const code = signal === "SIGINT" ? 130 : 143;
     process.stderr.write(`\n${streamInterruptedText(absolute)}\n`);
-    process.exit(signal === "SIGINT" ? 130 : 143);
+    let exited = false;
+    const finish = () => {
+      if (exited) return;
+      exited = true;
+      process.exit(code);
+    };
+    const timer = setTimeout(finish, STREAM_FLUSH_CEILING_MS);
+    timer.unref?.();
+    process.stdout.write("", finish);
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
