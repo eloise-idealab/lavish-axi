@@ -781,16 +781,22 @@ function optimisticPromptRoot(prompt) {
 // Marking a thread seen counts the optimistic stand-ins on screen, so retracting one has to hand
 // that credit back per reply - not merely cap the total. A real reply that landed while the POST
 // was in flight takes the retracted one's place in the count, so a cap alone would find nothing to
-// trim and let the seen count absorb an agent reply the user never opened. The cap still runs
-// beside the refund, so a seen count can never exceed the replies actually present either.
+// trim and let the seen count absorb an agent reply the user never opened. The refund is therefore
+// the whole mechanism, and it settles ONLY the roots whose stand-ins were actually dropped: a root
+// nobody dropped keeps its credit untouched, because `seen > present` there is the transient state
+// of a chat-sync rebuild that dropped a stand-in whose POST is still in flight - `unreadReplyCount`
+// floors at 0 so it costs nothing, while zeroing the credit is permanent and paints a false unread
+// badge on the user's own reply the moment that POST lands.
 /** @param {Map<string, number>} droppedByRoot */
 function settleSeenReplyCounts(droppedByRoot) {
   if (!seenReplyCount.size) return false;
   const { repliesByRoot } = groupThreads(orderedMessages());
   let changed = false;
-  for (const [rootId, seen] of seenReplyCount) {
+  for (const [rootId, dropped] of droppedByRoot) {
+    if (!seenReplyCount.has(rootId)) continue;
+    const seen = seenReplyCount.get(rootId) || 0;
     const present = (repliesByRoot.get(rootId) || []).length;
-    const settled = Math.max(0, Math.min(seen - (droppedByRoot.get(rootId) || 0), present));
+    const settled = Math.max(0, Math.min(seen - dropped, present));
     if (settled !== seen) {
       seenReplyCount.set(rootId, settled);
       changed = true;

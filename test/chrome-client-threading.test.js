@@ -1078,3 +1078,85 @@ test("a pill removed mid-flight is retracted when that POST is refused, without 
   assert.equal(chrome.threadingUnread("root1"), 0, "the reply the user already read stays read");
   assert.doesNotMatch(chrome.chatLogHtml(), /thread-chip unread/);
 });
+
+// Settlement is a per-thread refund, so it may only touch the threads a retraction actually took a
+// stand-in from. A chat-sync rebuild drops an in-flight reply's stand-in long before its POST
+// answers, leaving that thread's seen credit standing over an empty reply list; an unrelated
+// composer message taken back in that window names no thread at all. Settling every seen entry
+// against the live count zeroed a credit whose reply was still on the wire, and the moment it
+// landed the user's own message came back marked unread.
+test("taking back an unrelated prompt leaves an in-flight thread reply's seen credit alone", async () => {
+  /** @type {(ok: boolean) => void} */
+  let releasePost = () => {};
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).includes("/prompts")) return { ok: true, json: async () => ({}) };
+      return new Promise((resolve) => {
+        releasePost = (ok) => resolve({ ok, status: ok ? 200 : 400, json: async () => ({}) });
+      });
+    },
+  });
+  const syncChat = (chat) => chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat }) });
+  const root = { id: "root1", role: "agent", text: "Root message", at: 1 };
+  syncChat([root]);
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "still on the wire";
+  chrome.element("threadSend").onclick();
+  chrome.element("threadBack").dispatch("click", {});
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  syncChat([root]);
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "still on the wire"),
+    false,
+    "the rebuild dropped the stand-in while the POST carrying it is still unanswered",
+  );
+
+  chrome.element("chatInput").value = "unrelated, taken back";
+  chrome.element("send").click();
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["still on the wire", "unrelated, taken back"],
+    "the composer message queues beside the reply the in-flight POST is carrying",
+  );
+
+  chrome.removeQueuedPrompt(1);
+
+  assert.equal(
+    chrome.threadingOrdered().some((m) => m.text === "unrelated, taken back"),
+    false,
+    "its own stand-in goes, as a retraction always does",
+  );
+
+  releasePost(true);
+  await flushPromises();
+  syncChat([root, { id: "r1", role: "user", text: "still on the wire", reply_to: "root1", at: 2 }]);
+
+  assert.equal(
+    chrome.threadingUnread("root1"),
+    0,
+    "the credit that reply bought survived a retraction that named no thread: the user's own reply is not unread",
+  );
+  assert.doesNotMatch(chrome.chatLogHtml(), /thread-chip unread/);
+
+  chrome.threadingOpen("root1");
+  chrome.element("threadInput").value = "never mind this one";
+  chrome.element("threadSend").onclick();
+  chrome.element("threadBack").dispatch("click", {});
+
+  chrome.removeQueuedPrompt(0);
+
+  syncChat([
+    root,
+    { id: "r1", role: "user", text: "still on the wire", reply_to: "root1", at: 2 },
+    { id: "r2", role: "agent", text: "a real answer", reply_to: "root1", at: 3 },
+  ]);
+
+  assert.equal(
+    chrome.threadingUnread("root1"),
+    1,
+    "a root the retraction DID take a stand-in from still hands its credit back",
+  );
+  assert.match(chrome.chatLogHtml(), /thread-chip unread/);
+});
