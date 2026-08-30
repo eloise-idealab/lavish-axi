@@ -6460,6 +6460,81 @@ test("a fresh stream attaching alone retires the previous round's working presen
   }
 });
 
+test("a poll attaching beside a live stream leaves the stream's delivery marker alone", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-beside-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const controller = new AbortController();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await openSession(base, artifact);
+
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+      const streamRes = await fetch(`${base}/api/stream?file=${encodeURIComponent(artifact)}`, {
+        headers: { accept: "text/event-stream" },
+        signal: controller.signal,
+      });
+      assert.equal(streamRes.status, 200);
+      assert.equal(await presence.next(), "listening");
+
+      // Read this stream incrementally rather than through collectSseFrames, which cancels the
+      // reader when it returns - the connection has to stay attached for the sibling attach below.
+      const reader = streamRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const nextStreamFrame = async (eventName) => {
+        const deadline = Date.now() + 2000;
+        while (true) {
+          const parsed = parseSseFrames(buffer);
+          buffer = parsed.rest;
+          const found = parsed.frames.find((frame) => frame.event === eventName);
+          if (found) return found;
+          const remaining = Math.max(1, deadline - Date.now());
+          const { value, done } = await Promise.race([
+            reader.read(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error(`timed out waiting for a ${eventName} frame`)), remaining),
+            ),
+          ]);
+          if (done) throw new Error("stream closed before its frame arrived");
+          if (value) buffer += decoder.decode(value, { stream: true });
+        }
+      };
+
+      // The stream takes the user's message, so this round's delivery is recorded while that
+      // consumer is still attached - presence stays `listening` and emits nothing.
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
+      });
+      const message = await nextStreamFrame("message");
+      assert.equal(message.data.prompts[0].prompt, "hello");
+
+      // The other half of the shared refcount: attaching is only a new round when the consumer
+      // attaches ALONE. This poll arrives beside the live stream, so it must not erase the
+      // delivery the stream just recorded - the sibling erasure #301 fixed for two polls, now
+      // reachable across consumers because a stream shares the same counter.
+      const sibling = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=200`);
+      assert.deepEqual(await sibling.json(), { status: "waiting" });
+
+      // Both consumers are gone with nothing delivered since, so presence falls back to the
+      // marker: `working`, because the sibling attach preserved it.
+      controller.abort();
+      assert.equal(await presence.next(), "working");
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    controller.abort();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("GET /api/stream caps concurrent connections and frees the slot on disconnect (HIGH regression)", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-stream-cap-"));
   const artifact = path.join(dir, "artifact.html");
